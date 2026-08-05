@@ -10,6 +10,7 @@ rust_library(
         "src/boot_status.rs",
         "src/boot_watch.rs",
         "src/config.rs",
+        "src/evidence.rs",
         "src/lib.rs",
     ],
     edition = "2024",

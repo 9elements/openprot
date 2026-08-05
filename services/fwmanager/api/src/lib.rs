@@ -7,10 +7,11 @@
 //! single managed device's reset without knowing which controller line it
 //! maps to.
 //!
-//! `BootStatus` is the shared vocabulary for boot-liveness evidence. There
-//! is deliberately no observation *trait*: each `BootCheckpoint` a board
-//! table declares (`config::DeviceConfig::checkpoints`) carries its own
-//! evidence check, so how a signal is read stays inside the check.
+//! `BootStatus` is the shared vocabulary for boot-liveness evidence, and
+//! `EvidenceReader` resolves a board-defined signal id to it. The schema
+//! names no signal kinds: each board's device table declares its
+//! checkpoints as data (`config::BootCheckpoint`), and the board's reader
+//! gives the ids meaning.
 //!
 //! `BootWatch` is the seam the orchestrator polls: one device's boot walk,
 //! erased of every device-specific type, answering with a `WalkVerdict`.
@@ -29,7 +30,9 @@ mod boot_control;
 mod boot_status;
 mod boot_watch;
 pub mod config;
+mod evidence;
 
 pub use boot_control::BootControl;
 pub use boot_status::BootStatus;
 pub use boot_watch::{BootWatch, WalkVerdict};
+pub use evidence::EvidenceReader;
