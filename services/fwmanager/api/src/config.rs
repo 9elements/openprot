@@ -26,8 +26,13 @@ pub struct BootCheckpoint<G> {
     /// function, so the table stays pure data — the type-level docs say
     /// why.
     pub signal: G,
-    /// Window for one attempt at this checkpoint. Expiry is the
-    /// orchestrator's own judgment; hung devices report nothing.
+    /// Window for one attempt at this checkpoint. Expiry is the boot
+    /// walk's own judgment; hung devices report nothing.
+    ///
+    /// The orchestrator state machine never sees this value — it is
+    /// clockless. The walk consumes the windows and reports expiry as a
+    /// failed attempt; a component's whole boot timeout is nothing more
+    /// than its walk over these windows, in order.
     pub timeout: core::time::Duration,
 }
 
