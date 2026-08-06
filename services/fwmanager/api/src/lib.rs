@@ -34,5 +34,5 @@ mod evidence;
 
 pub use boot_control::BootControl;
 pub use boot_status::BootStatus;
-pub use boot_watch::{BootWatch, WalkVerdict};
+pub use boot_watch::{BootWatch, FailureCause, WalkVerdict};
 pub use evidence::EvidenceReader;
