@@ -1,0 +1,22 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# Pure, host-testable dispatch over openprot_orchestrator_sm. No kernel deps,
+# so it can be unit-tested on the host.
+rust_library(
+    name = "boot_orchestrator_server",
+    srcs = ["src/lib.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//services/boot_orchestrator/api:boot_orchestrator_api",
+        "//services/orchestrator/sm:orchestrator_sm",
+    ],
+)
+
+rust_test(
+    name = "boot_orchestrator_server_test",
+    crate = ":boot_orchestrator_server",
+)

@@ -1,0 +1,18 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# Wire protocol seam for the boot orchestrator IPC service. Host-buildable,
+# dependency-free leaf (no pw_kernel/userspace).
+rust_library(
+    name = "boot_orchestrator_api",
+    srcs = ["src/lib.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "boot_orchestrator_api_test",
+    crate = ":boot_orchestrator_api",
+)

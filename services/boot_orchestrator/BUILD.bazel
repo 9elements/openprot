@@ -1,0 +1,24 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+package(default_visibility = ["//visibility:public"])
+
+# Embedded-safe production crates only (no rust_test targets).
+filegroup(
+    name = "boot_orchestrator_embedded_all",
+    srcs = [
+        "//services/boot_orchestrator/api:boot_orchestrator_api",
+        "//services/boot_orchestrator/server:boot_orchestrator_server",
+        # Kernel-only crate (depends on pw_kernel userspace; not host-testable).
+        "//services/boot_orchestrator/server-runtime:boot_orchestrator_server_runtime",
+    ],
+)
+
+# Host-side tests; run without embedded target config.
+test_suite(
+    name = "boot_orchestrator_host_tests",
+    tests = [
+        "//services/boot_orchestrator/api:boot_orchestrator_api_test",
+        "//services/boot_orchestrator/server:boot_orchestrator_server_test",
+    ],
+)
