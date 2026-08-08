@@ -1566,9 +1566,9 @@ fn chain_derives_from_device_table() {
         &[CHECKPOINT],
     )
     .with_depends_on("root");
-    const TABLE: DeviceTable<u8, u8> = DeviceTable::new(&[ROOT, LEAF]);
+    const TABLE: DeviceTable<u8, u8, 2> = DeviceTable::new(&[ROOT, LEAF]);
 
-    let entries = Chain::<CAPACITY>::from_table(&TABLE).into_entries();
+    let entries = Chain::<2>::from_table(&TABLE).into_entries();
     assert_eq!(
         entries.as_slice(),
         &[
