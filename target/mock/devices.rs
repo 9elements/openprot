@@ -33,7 +33,7 @@ pub enum MockSignal {
 ///
 /// The mock board's reset controller addresses reset lines by plain index,
 /// so the reset id type is `u8`.
-pub const MANAGED_DEVICES: DeviceTable<u8, MockSignal> = DeviceTable::new(&[
+pub const MANAGED_DEVICES: DeviceTable<u8, MockSignal, 2> = DeviceTable::new(&[
     // Direct-flash SPI device (BMC archetype): the eRoT fronts its flash.
     // No iRoT, so the eRoT's check is the only trust gate (Passive), and
     // the platform is pointless without its BMC (Required). Single

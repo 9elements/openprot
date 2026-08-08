@@ -358,17 +358,8 @@ impl<const N: usize> Chain<N> {
     /// home yet — nothing consumes it — so every component gets the default
     /// region.
     ///
-    /// # Panics
-    ///
-    /// Panics if `N` is smaller than the table. Unreachable when `N` is
-    /// derived from the same table (`table.devices().len()`), which is the
-    /// only intended call shape.
-    pub fn from_table<R, G: 'static>(table: &orchestrator_config::DeviceTable<R, G>) -> Self {
+    pub fn from_table<R, G: 'static>(table: &orchestrator_config::DeviceTable<R, G, N>) -> Self {
         let devices = table.devices();
-        assert!(
-            devices.len() <= N,
-            "chain capacity N is smaller than the device table"
-        );
         let mut entries = heapless::Vec::new();
         for (i, device) in devices.iter().enumerate() {
             let depends_on = device.depends_on().map(|dep| {
@@ -384,6 +375,8 @@ impl<const N: usize> Chain<N> {
                 recovery_region: RegionId::new(0),
                 depends_on,
             };
+            // `DeviceTable<R, G, N>` and `Chain<N>` share the same const
+            // capacity, so this push cannot fail.
             let _ = entries.push((ComponentId::new(i as u8), attrs));
         }
         Self { entries }

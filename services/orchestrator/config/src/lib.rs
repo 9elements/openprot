@@ -259,11 +259,11 @@ impl<R, G> DeviceConfig<R, G> {
 /// the proof, and downstream conversions (the orchestrator's chain of
 /// trust) need no failure path of their own.
 #[derive(Debug, Clone, Copy)]
-pub struct DeviceTable<R: 'static, G: 'static> {
-    devices: &'static [DeviceConfig<R, G>],
+pub struct DeviceTable<R: 'static, G: 'static, const N: usize> {
+    devices: &'static [DeviceConfig<R, G>; N],
 }
 
-impl<R, G> DeviceTable<R, G> {
+impl<R, G, const N: usize> DeviceTable<R, G, N> {
     /// Declares the board's device table. `const`, so a bad table is a
     /// build error.
     ///
@@ -276,10 +276,10 @@ impl<R, G> DeviceTable<R, G> {
     /// dangling and self dependencies: a dependency is always walked
     /// before its dependents).
     #[must_use]
-    pub const fn new(devices: &'static [DeviceConfig<R, G>]) -> Self {
-        assert!(!devices.is_empty(), "device table must not be empty");
+    pub const fn new(devices: &'static [DeviceConfig<R, G>; N]) -> Self {
+        assert!(N != 0, "device table must not be empty");
         assert!(
-            devices.len() <= u8::MAX as usize,
+            N <= u8::MAX as usize,
             "device table exceeds the orchestrator's cursor bound"
         );
         let mut i = 0;
@@ -313,7 +313,7 @@ impl<R, G> DeviceTable<R, G> {
 
     /// The devices, in declaration order — which is the boot order.
     #[must_use]
-    pub const fn devices(&self) -> &'static [DeviceConfig<R, G>] {
+    pub const fn devices(&self) -> &'static [DeviceConfig<R, G>; N] {
         self.devices
     }
 }
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "device table must not be empty")]
     fn rejects_an_empty_table() {
-        let _ = DeviceTable::new(&[] as &[DeviceConfig<u8, u8>]);
+        let _ = DeviceTable::new(&[] as &[DeviceConfig<u8, u8>; 0]);
     }
 
     #[test]
