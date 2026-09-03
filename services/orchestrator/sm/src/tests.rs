@@ -1019,6 +1019,36 @@ fn mid_walk_cascade_skips_unreached_dependents() {
     assert!(!effects.contains(&Effect::AssertReset(C0)));
 }
 
+/// A cascade during `AwaitingReady` gates the component under verification and
+/// the walk moves on to C3. C1's in-flight verdict no longer matches the cursor
+/// and is dropped, so C1 stays in reset. `awaiting` survives the `Handled`.
+#[test]
+fn mid_walk_cascade_in_awaiting_ready_drops_late_verdict() {
+    let (effects, state) = drive(
+        chain(&[
+            (C0, ComponentAttrs::active_required()),
+            (C1, ComponentAttrs::passive_cascading()),
+            (C2, ComponentAttrs::passive_required().with_depends_on(C1)),
+            (C3, ComponentAttrs::passive_required()),
+        ]),
+        &[
+            BOOT,
+            Event::VerificationPassed(C0), // releases C0, cursor on C1
+            Event::CorruptionDetected(C1), // gates C1 -> C2, cursor moves to C3
+            Event::VerificationPassed(C1), // in flight before the gating
+        ],
+    );
+    // Still awaiting C0's readiness: the cursor moved, the payload did not.
+    assert_eq!(state, State::AwaitingReady(Some(C0)));
+    for id in [C1, C2] {
+        assert!(effects.contains(&Effect::ReportIsolated(id)));
+        assert!(!effects.contains(&Effect::ReleaseReset(id)));
+    }
+    // The walk carries on past the isolated pair.
+    assert!(effects.contains(&Effect::ReadFirmware(C3)));
+    assert!(effects.contains(&Effect::VerifyFirmware(C3)));
+}
+
 /// A component gated while it is under verification is never released by its
 /// own in-flight verdict. Release keys off `chain[cursor]` alone, so leaving
 /// the cursor on a component the cascade just isolated would take it out of
@@ -1071,6 +1101,35 @@ fn gating_the_last_ungated_component_ends_the_walk() {
     assert!(!effects.contains(&Effect::ReleaseReset(C0)));
     assert!(!effects.contains(&Effect::ReleaseReset(C1)));
     assert!(!effects.contains(&Effect::ReadFirmware(C1)));
+    assert!(!effects.contains(&Effect::LatchLockdown));
+}
+
+/// The `AwaitingReady` analog of
+/// `gating_the_last_ungated_component_ends_the_walk`: gating the component
+/// under verification when nothing ungated follows it ends the walk at `Ready`,
+/// with the isolated pair held and no lockdown. C0 is still awaiting its boot
+/// signal; the walk finishing does not wait on it.
+#[test]
+fn gating_the_rest_of_the_chain_in_awaiting_ready_ends_the_walk() {
+    let (effects, state) = drive(
+        chain(&[
+            (C0, ComponentAttrs::active_required()),
+            (C1, ComponentAttrs::passive_cascading()),
+            (C2, ComponentAttrs::passive_required().with_depends_on(C1)),
+        ]),
+        &[
+            BOOT,
+            Event::VerificationPassed(C0), // releases C0, cursor on C1
+            Event::CorruptionDetected(C1), // gates C1 -> C2, nothing left ungated
+            Event::VerificationPassed(C1), // in flight before the gating
+        ],
+    );
+    assert_eq!(state, State::Ready);
+    for id in [C1, C2] {
+        assert!(effects.contains(&Effect::ReportIsolated(id)));
+        assert!(!effects.contains(&Effect::ReleaseReset(id)));
+    }
+    assert!(!effects.contains(&Effect::ReadFirmware(C2)));
     assert!(!effects.contains(&Effect::LatchLockdown));
 }
 

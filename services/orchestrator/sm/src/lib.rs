@@ -650,6 +650,10 @@ impl<const N: usize, const E: usize> Rot<N, E> {
                     // of the component's recovery-failure policy.
                     Outcome::Transition(State::Recovering(*id))
                 }
+                // This state releases off `chain[cursor]` too, so the cursor must
+                // move off a component the cascade gated. `Handled` keeps
+                // `awaiting`.
+                Event::CorruptionDetected(id) => self.handle_corruption_advancing(*id, ctx),
                 // `Timeout` is intentionally not handled here: it falls through
                 // to `handle_supervising`, which runs the device-agnostic
                 // boot-progress watchdog uniformly across every supervised state
@@ -779,11 +783,11 @@ impl<const N: usize, const E: usize> Rot<N, E> {
     /// supervisor, is discarded).
     ///
     /// The corruption guarantee, however, *does* hold in `PreSupervision`: that
-    /// state handles [`Event::CorruptionDetected`] directly (via
-    /// [`handle_corruption_advancing`](Self::handle_corruption_advancing)) rather
+    /// state handles [`Event::CorruptionDetected`] in its own arm, via
+    /// [`handle_corruption_advancing`](Self::handle_corruption_advancing), rather
     /// than through this handler, since routing it here would also pull in the
-    /// attestation
-    /// behavior above. CSA defines no mechanism guaranteeing a corruption report
+    /// attestation behavior above. `AwaitingReady` handles it the same way in its
+    /// own arm; the cursor rationale is on the helper. CSA defines no mechanism guaranteeing a corruption report
     /// arrives for an already-released component's *live, executing* state (its
     /// only at-rest mechanism — background NVM integrity polling — is explicitly
     /// scoped to "at rest"/"between boots", not an in-progress boot's chain
@@ -797,6 +801,8 @@ impl<const N: usize, const E: usize> Rot<N, E> {
                 ctx.emit(Effect::SignAttestation);
                 Outcome::Handled
             }
+            // Reached from `Ready` and `Recovering` only: `PreSupervision`,
+            // `AwaitingReady` and `Updating` handle this in their own arms.
             Event::CorruptionDetected(id) => self.handle_corruption(*id, ctx),
             // Boot-progress signals arriving after the walk left `PreSupervision`
             // / `AwaitingReady` (e.g. once the machine is already `Ready`): clear
