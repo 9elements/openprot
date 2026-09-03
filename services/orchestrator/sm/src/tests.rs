@@ -1019,6 +1019,31 @@ fn mid_walk_cascade_skips_unreached_dependents() {
     assert!(!effects.contains(&Effect::AssertReset(C0)));
 }
 
+/// Corruption during recovery gates and stops there. The cursor is stale in
+/// `Recovering`, so advancing it would verify C2 mid-recovery or end the walk
+/// at `Ready`, skipping the re-walk that recovery exists to run.
+#[test]
+fn corruption_during_recovery_does_not_advance_the_walk() {
+    let (effects, state) = drive(
+        chain(&[
+            (C0, ComponentAttrs::passive_cascading()),
+            (C1, ComponentAttrs::passive_required().with_depends_on(C0)),
+            (C2, ComponentAttrs::passive_required()),
+        ]),
+        &[
+            BOOT,
+            Event::VerificationFailed(C0), // cursor stays on C0
+            Event::CorruptionDetected(C0), // gates C0 -> C1
+        ],
+    );
+    assert_eq!(state, State::Recovering(C0));
+    assert!(effects.contains(&Effect::ReportIsolated(C0)));
+    assert!(effects.contains(&Effect::ReportIsolated(C1)));
+    // The walk does not resume from inside recovery.
+    assert!(!effects.contains(&Effect::ReadFirmware(C2)));
+    assert!(!effects.contains(&Effect::VerifyFirmware(C2)));
+}
+
 /// A cascade during `AwaitingReady` gates the component under verification and
 /// the walk moves on to C3. C1's in-flight verdict no longer matches the cursor
 /// and is dropped, so C1 stays in reset. `awaiting` survives the `Handled`.
