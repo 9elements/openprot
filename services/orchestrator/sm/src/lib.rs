@@ -424,9 +424,8 @@ impl<const N: usize, const E: usize> Rot<N, E> {
         }
     }
 
-    /// Shared `CorruptionDetected` handling, called from both `PreSupervision`
-    /// (directly) and `SupervisingPlatform` (via its superstate handler).
-    /// Delegates the policy interpretation to [`gate_by_policy`](Self::gate_by_policy)
+    /// Shared `CorruptionDetected` handling. Delegates the policy interpretation
+    /// to [`gate_by_policy`](Self::gate_by_policy)
     /// so this path and the recovery-exhaustion path can never diverge:
     /// `Isolable`/`Cascading` → gate the component (single or cascade) and stay
     /// put, so a later re-walk skips it instead of silently re-releasing one we
@@ -436,6 +435,33 @@ impl<const N: usize, const E: usize> Rot<N, E> {
         match self.gate_by_policy(ctx, id) {
             Gating::Gated => Outcome::Handled,
             Gating::NotGated => Outcome::Transition(State::Recovering(id)),
+        }
+    }
+
+    /// `CorruptionDetected` for the two states that release off `chain[cursor]`,
+    /// `PreSupervision` and `AwaitingReady`. Gates by policy, then moves the
+    /// cursor off the component under verification if the cascade gated it, so a
+    /// verdict already in flight is a cursor mismatch and gets dropped instead of
+    /// releasing an isolated component. A `Required` corruption gates nothing and
+    /// returns `Transition(Recovering)` unchanged.
+    ///
+    /// Not called from `handle_supervising`: in `Recovering` the cursor is stale
+    /// (`VerificationFailed` left it on the failed component), so advancing would
+    /// verify mid-recovery and could reach `Ready` instead of re-walking.
+    fn handle_corruption_advancing(&mut self, id: ComponentId, ctx: &mut Sink<E>) -> Outcome {
+        let outcome = self.handle_corruption(id, ctx);
+        let cursor_gated = self
+            .chain
+            .get(self.cursor as usize)
+            .is_some_and(|(c, _)| self.is_gated(*c));
+        if !matches!(outcome, Outcome::Handled) || !cursor_gated {
+            return outcome;
+        }
+        let next_idx = (self.cursor as usize).saturating_add(1);
+        if self.advance_to_next_ungated(ctx, next_idx) {
+            Outcome::Handled
+        } else {
+            Outcome::Transition(State::Ready)
         }
     }
 
@@ -541,30 +567,7 @@ impl<const N: usize, const E: usize> Rot<N, E> {
                 // exists in the first place. `AttestationChallenge` is left
                 // unhandled here (falls through to `Outcome::Super` and is
                 // discarded) — that's a separate question.
-                Event::CorruptionDetected(id) => {
-                    let outcome = self.handle_corruption(*id, ctx);
-                    // The cascade can gate the component under verification,
-                    // leaving the cursor on it. Release keys off
-                    // `chain[cursor]` alone, so a `VerificationPassed` already
-                    // in flight would take an isolated component back out of
-                    // reset. Moving the cursor past it makes that verdict a
-                    // mismatch in the `VerificationPassed` arm, which drops it.
-                    // A `Required` corruption gates nothing and transitions to
-                    // `Recovering`; that outcome stands.
-                    let cursor_gated = self
-                        .chain
-                        .get(self.cursor as usize)
-                        .is_some_and(|(c, _)| self.is_gated(*c));
-                    if !matches!(outcome, Outcome::Handled) || !cursor_gated {
-                        return outcome;
-                    }
-                    let next_idx = (self.cursor as usize).saturating_add(1);
-                    if self.advance_to_next_ungated(ctx, next_idx) {
-                        Outcome::Handled
-                    } else {
-                        Outcome::Transition(State::Ready)
-                    }
-                }
+                Event::CorruptionDetected(id) => self.handle_corruption_advancing(*id, ctx),
                 // Boot-progress liveness for a passive component released
                 // speculatively earlier in this same walk. Clear its watchdog
                 // even though `PreSupervision` is unsupervised — acting on a
@@ -777,8 +780,9 @@ impl<const N: usize, const E: usize> Rot<N, E> {
     ///
     /// The corruption guarantee, however, *does* hold in `PreSupervision`: that
     /// state handles [`Event::CorruptionDetected`] directly (via
-    /// [`handle_corruption`](Self::handle_corruption)) rather than through this
-    /// handler, since routing it here would also pull in the attestation
+    /// [`handle_corruption_advancing`](Self::handle_corruption_advancing)) rather
+    /// than through this handler, since routing it here would also pull in the
+    /// attestation
     /// behavior above. CSA defines no mechanism guaranteeing a corruption report
     /// arrives for an already-released component's *live, executing* state (its
     /// only at-rest mechanism — background NVM integrity polling — is explicitly
