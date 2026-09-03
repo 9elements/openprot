@@ -2060,6 +2060,32 @@ impl SplitMix64 {
     }
 }
 
+/// Build a random three-component chain: kind, failure policy and dependency
+/// edge all vary per seed. A fixed shape hides whole classes of bug. The
+/// cursor-gating races only become reachable in `AwaitingReady` when a gateable
+/// component sits after an active one, which the old fixed chain never did, so
+/// the shape is part of what gets fuzzed.
+fn random_chain(rng: &mut SplitMix64) -> heapless::Vec<(ComponentId, ComponentAttrs), CAPACITY> {
+    let ids = [C0, C1, C2];
+    let mut c = heapless::Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        let mut attrs = match rng.below(6) {
+            0 => ComponentAttrs::active_required(),
+            1 => ComponentAttrs::passive_required(),
+            2 => ComponentAttrs::active_isolable(),
+            3 => ComponentAttrs::passive_isolable(),
+            4 => ComponentAttrs::active_cascading(),
+            _ => ComponentAttrs::passive_cascading(),
+        };
+        // Depend on an earlier component half the time, so cascades have depth.
+        if i > 0 && rng.below(2) == 0 {
+            attrs = attrs.with_depends_on(ids[rng.below(i as u32) as usize]);
+        }
+        c.push((id, attrs)).expect("chain within CAPACITY");
+    }
+    c
+}
+
 /// Build one random event over the given id palette. Id-less events ignore it.
 fn random_event(rng: &mut SplitMix64, ids: &[ComponentId]) -> Event {
     let id = ids[rng.below(ids.len() as u32) as usize];
@@ -2084,7 +2110,7 @@ fn random_event(rng: &mut SplitMix64, ids: &[ComponentId]) -> Event {
 
 #[test]
 fn property_verify_before_release_holds_under_random_sequences() {
-    const RUNS: u64 = 4000;
+    const RUNS: u64 = 20_000;
     const MAX_LEN: u32 = 24;
 
     // C0..C2 are in-chain; C3 is intentionally out-of-chain — fed as noise so
@@ -2095,11 +2121,7 @@ fn property_verify_before_release_holds_under_random_sequences() {
     for seed in 0..RUNS {
         let mut rng = SplitMix64(seed.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(1));
 
-        let ch = chain(&[
-            (C0, ComponentAttrs::passive_required()),
-            (C1, ComponentAttrs::active_isolable()),
-            (C2, ComponentAttrs::passive_required()),
-        ]);
+        let ch = random_chain(&mut rng);
         let mut orch =
             Orchestrator::<CAPACITY, ECAP>::new(ch.try_into().expect("valid chain"), MAX_RETRY);
         let mut platform = Recorder::new();
