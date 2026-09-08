@@ -23,6 +23,13 @@ Design decisions:
 - A Rejected veto becomes an error completion code in the RequestUpdate
   response, ALREADY_IN_UPDATE_MODE when the reason is an update already
   running; the UA retries.
+- Write access is two layers: a typed StagingWindow inside PLDM (Rust, catches
+  offset bugs) backed by an SMC write filter PLDM cannot reprogram (catches a
+  compromised process). The orchestrator opens the filter on Offer and closes
+  it on Complete/Abort/timeout. How the filter registers are kept out of
+  PLDM's reach (separate MPU region, separate controller/CS, lock-until-reset)
+  depends on the AST10x0 register layout; see "Who owns the SPI flash
+  controller" in open questions.
 - Transfer loop is zero-IPC: PLDM writes firmware bytes direct to flash and
   tracks progress locally. Complete carries the byte count for the
   orchestrator's coverage check (early-fail only, verify hashes the staged
@@ -116,6 +123,39 @@ sequenceDiagram
     Note over UA, Flash: Blocking direction: always PLDM -> Orchestrator, never the reverse.<br/>Every IPC response is immediate. Effects run async via poll_stage (one step, return, repeat).<br/>PLDM stays free to service UA on MCTP. USER signal nudge replaces blind polling.<br/>FD initiates TransferComplete, VerifyComplete, ApplyComplete. UA initiates ActivateFirmware, GetStatus and CancelUpdate.
 ```
 
+## Write-access containment
+
+PLDM writes firmware bytes direct to flash (zero-IPC, see above), so write
+access must be confined to the inactive slot and only for the duration of the
+transfer. Two layers, each catching a different class of failure:
+
+The first layer is a typed StagingWindow inside the PLDM process. When PLDM
+receives a Receiving response it constructs the window: a bounded handle over
+the inactive slot (base address + length, capped to slot size). All writes go
+through the window; it translates offsets and rejects anything outside the
+region. The window is dropped on Complete, Abort, or timeout, so PLDM holds
+no flash handle outside an active transfer. This catches offset bugs and
+use-after-transfer bugs but not a compromised process, because PLDM still has
+the underlying flash mapped. Whether Receiving carries an explicit base or the
+staging region is board-static is an open question (see below).
+
+The second layer is a hardware write filter that PLDM cannot reprogram. The
+SMC raises SmcInterrupt::WriteProtected on writes outside an allowed region
+(interrupts.rs:59). The orchestrator (or a dedicated flash-service process)
+opens the filter for the staging region on Offer and closes it on
+Complete/Abort/timeout. PLDM needs the SMC control registers that drive
+erase/program commands, but must not be able to touch the filter/write-protect
+registers. Whether those register sets are separable (distinct MPU pages,
+separate controller/CS, or lock-until-reset bits) depends on the AST10x0
+register layout and is folded into the "who owns the SPI flash controller"
+open question below.
+
+The net effect: bugs hit the Rust window check, a compromised process hits the
+hardware filter, and both "inactive slot only" and "only during an update" are
+enforced. Even a fully rogue PLDM can at worst corrupt the staging area and
+fail verify; the active image is never written by PLDM at any point in the
+flow, and activation is orchestrator-side metadata plus the SVN bump in OTP.
+
 ## Open questions
 
 Who owns the SPI flash controller. The diagram has PLDM writing the staging
@@ -124,7 +164,16 @@ says nothing about multiple clients. Either each process drives its own
 controller over disjoint regions, or one process owns the driver and the other
 reaches it over IPC. Sequencing keeps the two off the same bytes at the same
 time (the orchestrator reads only after Complete), so this is about the driver
-and the controller, not about the protocol.
+and the controller, not about the protocol. A related constraint from the
+write-access containment section: PLDM needs the erase/program control
+registers but must not reach the write-protect/filter registers. Whether those
+register sets fall on separate MPU pages on the AST10x0 (datasheet needed)
+determines whether pw_kernel can enforce the split, or whether a dedicated
+flash-service process must own the entire SMC and proxy writes.
+
+Whether Receiving carries an explicit base address for the staging region or
+the region is board-static. The typed StagingWindow needs a base; today
+Receiving only carries total.
 
 Whether the kernel can tell the orchestrator that PLDM's channel closed. That
 would replace the transfer-time timeout, which has to be generous.
