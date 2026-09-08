@@ -2287,6 +2287,82 @@ fn random_event(rng: &mut SplitMix64, ids: &[ComponentId]) -> Event {
 /// rest of the run takes it out of reset or hands it to recovery. The
 /// verify-before-release property misses the recovery half of that, because
 /// recovery re-verifies before releasing.
+/// A `Cascading` component takes its whole dependent subtree with it. Only
+/// `Cascading` carries that promise: `Isolable` isolates the one component and
+/// its dependents keep running, so the check is scoped to cascading roots.
+/// Traversing only ungated dependents used to stop the walk at a component that
+/// was already isolated, leaving the subtree behind it out of reset.
+#[test]
+fn property_cascading_isolation_reaches_the_whole_subtree() {
+    const RUNS: u64 = 20_000;
+    const MAX_LEN: u32 = 24;
+
+    let palette = [C0, C1, C2, C3];
+
+    for seed in 0..RUNS {
+        let mut rng = SplitMix64(seed.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(1));
+
+        let ch = random_chain(&mut rng);
+        let mut orch = Orchestrator::<CAPACITY, ECAP>::new(
+            ch.clone().try_into().expect("valid chain"),
+            MAX_RETRY,
+        );
+        let mut platform = Recorder::new();
+
+        orch.dispatch(&mut platform, BOOT);
+        let len = 1 + rng.below(MAX_LEN);
+        for _ in 0..len {
+            let event = random_event(&mut rng, &palette);
+            orch.dispatch(&mut platform, event);
+        }
+
+        let mut isolated = [false; CAPACITY];
+        for effect in &platform.recorded {
+            if let Effect::ReportIsolated(id) = effect {
+                isolated[id.get() as usize] = true;
+            }
+        }
+
+        // Seed the obligation with the dependents of every isolated
+        // `Cascading` component, then propagate it down the `depends_on` edges
+        // to a fixed point. Propagation ignores the intermediate components'
+        // own policies: `cascade_hold` gates a subtree whatever the nodes in it
+        // are configured as, so an `Isolable` component in the middle must not
+        // stop the obligation.
+        let mut must_isolate = [false; CAPACITY];
+        for &(id, attrs) in ch.iter() {
+            let Some(holder) = attrs.depends_on else {
+                continue;
+            };
+            let holder_cascading = ch
+                .iter()
+                .find(|(c, _)| *c == holder)
+                .is_some_and(|(_, a)| a.failure_policy == FailurePolicy::Cascading);
+            if isolated[holder.get() as usize] && holder_cascading {
+                must_isolate[id.get() as usize] = true;
+            }
+        }
+        for _ in 0..ch.len() {
+            for &(id, attrs) in ch.iter() {
+                if let Some(holder) = attrs.depends_on
+                    && must_isolate[holder.get() as usize]
+                {
+                    must_isolate[id.get() as usize] = true;
+                }
+            }
+        }
+        for &(id, _) in ch.iter() {
+            if must_isolate[id.get() as usize] {
+                assert!(
+                    isolated[id.get() as usize],
+                    "seed {seed}: {id:?} is under an isolated cascading component \
+                     but was never isolated",
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn property_isolation_is_sticky_under_random_sequences() {
     const RUNS: u64 = 20_000;
