@@ -1298,6 +1298,41 @@ fn corruption_report_for_an_isolated_component_is_dropped() {
     );
 }
 
+/// A cascade reaches past a component that is already isolated. C1 is gated on
+/// its own first, so the walk from C0 has to continue through it to reach C2.
+/// Stopping at C1 would leave C2 out of reset with both components it depends
+/// on isolated.
+#[test]
+fn cascade_reaches_past_an_already_isolated_component() {
+    let (effects, state) = drive(
+        chain(&[
+            (C0, ComponentAttrs::passive_cascading()),
+            (C1, ComponentAttrs::passive_isolable().with_depends_on(C0)),
+            (C2, ComponentAttrs::passive_required().with_depends_on(C1)),
+        ]),
+        &[
+            BOOT,
+            Event::CorruptionDetected(C1), // isolable: gates C1 alone
+            Event::CorruptionDetected(C0), // cascading: C0 -> C1 -> C2
+            Event::VerificationPassed(C2),
+        ],
+    );
+    assert_eq!(state, State::Ready);
+    for id in [C0, C1, C2] {
+        assert!(effects.contains(&Effect::ReportIsolated(id)));
+        assert!(!effects.contains(&Effect::ReleaseReset(id)));
+    }
+    // C1 is reported once, by the corruption that gated it, not again by the
+    // cascade passing through.
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|e| **e == Effect::ReportIsolated(C1))
+            .count(),
+        1
+    );
+}
+
 /// Runtime corruption under a non-`Required` policy reports too. This path
 /// never enters recovery at all, so without its own report the isolation would
 /// be silent.
