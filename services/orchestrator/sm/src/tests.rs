@@ -1069,7 +1069,6 @@ fn mid_walk_cascade_in_awaiting_ready_drops_late_verdict() {
         assert!(effects.contains(&Effect::ReportIsolated(id)));
         assert!(!effects.contains(&Effect::ReleaseReset(id)));
     }
-    // The walk carries on past the isolated pair.
     assert!(effects.contains(&Effect::ReadFirmware(C3)));
     assert!(effects.contains(&Effect::VerifyFirmware(C3)));
 }
@@ -1179,16 +1178,15 @@ fn cascade_in_awaiting_ready_below_the_cursor_leaves_it_alone() {
     assert_eq!(state, State::Ready);
     // The cursor never left C1, so its verdict still counts.
     assert!(effects.contains(&Effect::ReleaseReset(C1)));
-    // C2 is gated before its turn and the walk skips it.
     assert!(effects.contains(&Effect::ReportIsolated(C2)));
     assert!(!effects.contains(&Effect::ReleaseReset(C2)));
     assert!(!effects.contains(&Effect::ReadFirmware(C2)));
 }
 
 /// The cascade gates the component the `AwaitingReady` slot waits on. The slot
-/// keeps naming it, which is harmless: `gate_one` cleared its `awaiting_boot`,
-/// a late `ComponentReady` releases nothing, and the walk reaches `Ready`
-/// through the cursor rather than through readiness.
+/// keeps naming it, and that costs nothing: `gate_one` cleared its
+/// `awaiting_boot`, a late `ComponentReady` releases nothing, and the walk
+/// reaches `Ready` through the cursor rather than through readiness.
 #[test]
 fn gating_the_awaited_component_does_not_stall_the_walk() {
     let (effects, state) = drive(
@@ -1215,15 +1213,12 @@ fn gating_the_awaited_component_does_not_stall_the_walk() {
         assert!(effects.contains(&Effect::ReportIsolated(id)));
     }
     assert!(!effects.contains(&Effect::ReleaseReset(C1)));
-    // The walk moved past the isolated pair and finished on C2.
     assert!(effects.contains(&Effect::ReadFirmware(C2)));
     assert!(effects.contains(&Effect::ReleaseReset(C2)));
 }
 
 /// A failure verdict in flight when the cascade gated the component does not
-/// drag it into recovery. The re-walk would skip it anyway, so recovering an
-/// isolated component costs a full chain re-walk and a RecoverComponent
-/// against a device that stays held.
+/// drag it into recovery.
 #[test]
 fn late_verification_failed_for_gated_component_is_dropped() {
     let (effects, state) = drive(
@@ -1248,9 +1243,9 @@ fn late_verification_failed_for_gated_component_is_dropped() {
 }
 
 /// A contained cascade does not lock the platform down through the `Required`
-/// component it held. Each corruption report for the isolated C1 used to
-/// re-enter recovery, and the third exhausted its retries: `gate_by_policy`
-/// then read C1's own `Required` policy and escalated. MAX_RETRY is 3.
+/// component it held. Three corruption reports for the isolated C1 would
+/// otherwise exhaust its retries, and `gate_by_policy` would read C1's own
+/// `Required` policy and escalate. MAX_RETRY is 3.
 #[test]
 fn contained_cascade_does_not_lock_down_via_its_required_dependent() {
     let (effects, state) = drive(
@@ -1276,8 +1271,7 @@ fn contained_cascade_does_not_lock_down_via_its_required_dependent() {
 }
 
 /// A corruption report for a component the cascade already isolated is
-/// dropped. It is held in reset and was reported; recovering it would restore
-/// a component the re-walk skips.
+/// dropped.
 #[test]
 fn corruption_report_for_an_isolated_component_is_dropped() {
     let (effects, state) = drive(
@@ -2250,11 +2244,9 @@ fn random_event(rng: &mut SplitMix64, ids: &[ComponentId]) -> Event {
 }
 
 /// Isolation is sticky: once a component is reported isolated, nothing in the
-/// rest of the run takes it out of reset or hands it to recovery. All four bugs
-/// in this class broke it: both cursor-gating races, the stale failure verdict,
-/// and the corruption report for a component already held. The
-/// verify-before-release property sees none of them, because recovery
-/// re-verifies before releasing.
+/// rest of the run takes it out of reset or hands it to recovery. The
+/// verify-before-release property misses the recovery half of that, because
+/// recovery re-verifies before releasing.
 #[test]
 fn property_isolation_is_sticky_under_random_sequences() {
     const RUNS: u64 = 20_000;
