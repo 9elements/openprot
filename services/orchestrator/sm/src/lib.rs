@@ -432,6 +432,13 @@ impl<const N: usize, const E: usize> Rot<N, E> {
     /// already found corrupt; `Required` → recover first (the halt-on-exhaustion
     /// decision happens later in `Recovering`).
     fn handle_corruption(&mut self, id: ComponentId, ctx: &mut Sink<E>) -> Outcome {
+        // Already isolated: it is held in reset and was reported. Recovering it
+        // would restore a component the re-walk skips, and on exhaustion a
+        // `Required` one would lock the platform down over a cascade that was
+        // already contained.
+        if self.is_gated(id) {
+            return Outcome::Handled;
+        }
         match self.gate_by_policy(ctx, id) {
             Gating::Gated => Outcome::Handled,
             Gating::NotGated => Outcome::Transition(State::Recovering(id)),

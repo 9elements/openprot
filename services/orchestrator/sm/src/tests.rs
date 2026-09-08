@@ -1247,6 +1247,58 @@ fn late_verification_failed_for_gated_component_is_dropped() {
     );
 }
 
+/// A contained cascade does not lock the platform down through the `Required`
+/// component it held. Each corruption report for the isolated C1 used to
+/// re-enter recovery, and the third exhausted its retries: `gate_by_policy`
+/// then read C1's own `Required` policy and escalated. MAX_RETRY is 3.
+#[test]
+fn contained_cascade_does_not_lock_down_via_its_required_dependent() {
+    let (effects, state) = drive(
+        chain(&[
+            (C0, ComponentAttrs::passive_cascading()),
+            (C1, ComponentAttrs::passive_required().with_depends_on(C0)),
+        ]),
+        &[
+            BOOT,
+            Event::CorruptionDetected(C0), // gates C0, cascade-holds C1
+            Event::CorruptionDetected(C1), // isolated C1 into recovery, attempt 0
+            Event::Restored(C1),
+            Event::CorruptionDetected(C1), // attempt 1
+            Event::Restored(C1),
+            Event::CorruptionDetected(C1), // attempt 2
+            Event::Restored(C1),           // retries exhausted
+        ],
+    );
+    assert!(
+        !effects.contains(&Effect::LatchLockdown),
+        "contained cascade reached lockdown, state {state:?}"
+    );
+}
+
+/// A corruption report for a component the cascade already isolated is
+/// dropped. It is held in reset and was reported; recovering it would restore
+/// a component the re-walk skips.
+#[test]
+fn corruption_report_for_an_isolated_component_is_dropped() {
+    let (effects, state) = drive(
+        chain(&[
+            (C0, ComponentAttrs::passive_cascading()),
+            (C1, ComponentAttrs::passive_required().with_depends_on(C0)),
+        ]),
+        &[
+            BOOT,
+            Event::CorruptionDetected(C0), // gates C0, cascade-holds C1
+            Event::CorruptionDetected(C1), // C1 is already isolated
+        ],
+    );
+    assert!(effects.contains(&Effect::ReportIsolated(C1)));
+    assert_ne!(state, State::Recovering(C1), "isolated C1 entered recovery");
+    assert!(
+        !effects.contains(&Effect::RecoverComponent { id: C1, attempt: 0 }),
+        "RecoverComponent fired for cascade-held C1"
+    );
+}
+
 /// Runtime corruption under a non-`Required` policy reports too. This path
 /// never enters recovery at all, so without its own report the isolation would
 /// be silent.
