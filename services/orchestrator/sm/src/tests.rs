@@ -1019,9 +1019,9 @@ fn mid_walk_cascade_skips_unreached_dependents() {
     assert!(!effects.contains(&Effect::AssertReset(C0)));
 }
 
-/// Corruption during recovery gates and stops there. The cursor is stale in
-/// `Recovering`, so advancing it would verify C2 mid-recovery or end the walk
-/// at `Ready`, skipping the re-walk that recovery exists to run.
+/// Corruption during recovery gates and stops there. `Recovering`'s cursor is
+/// stale, so advancing it would verify C2 mid-recovery, or end the walk at
+/// `Ready` and skip the re-walk recovery exists to run.
 #[test]
 fn corruption_during_recovery_does_not_advance_the_walk() {
     let (effects, state) = drive(
@@ -1044,9 +1044,9 @@ fn corruption_during_recovery_does_not_advance_the_walk() {
     assert!(!effects.contains(&Effect::VerifyFirmware(C2)));
 }
 
-/// A cascade during `AwaitingReady` gates the component under verification and
+/// A cascade during `AwaitingReady` gates the component under verification, so
 /// the walk moves on to C3. C1's in-flight verdict no longer matches the cursor
-/// and is dropped, so C1 stays in reset. `awaiting` survives the `Handled`.
+/// and is dropped, leaving C1 in reset. `awaiting` survives the `Handled`.
 #[test]
 fn mid_walk_cascade_in_awaiting_ready_drops_late_verdict() {
     let (effects, state) = drive(
@@ -1130,10 +1130,9 @@ fn gating_the_last_ungated_component_ends_the_walk() {
 }
 
 /// The `AwaitingReady` analog of
-/// `gating_the_last_ungated_component_ends_the_walk`: gating the component
-/// under verification when nothing ungated follows it ends the walk at `Ready`,
-/// with the isolated pair held and no lockdown. C0 is still awaiting its boot
-/// signal; the walk finishing does not wait on it.
+/// `gating_the_last_ungated_component_ends_the_walk`: with nothing ungated left
+/// to move to, the walk ends at `Ready`, the isolated pair held and no
+/// lockdown. C0 still owes a boot signal; the walk does not wait on it.
 #[test]
 fn gating_the_rest_of_the_chain_in_awaiting_ready_ends_the_walk() {
     let (effects, state) = drive(
@@ -1388,7 +1387,8 @@ fn required_failure_in_awaiting_ready_enters_recovering() {
 }
 
 /// CorruptionDetected while in AwaitingReady (required component) →
-/// Recovering via the SupervisingPlatform superstate handler.
+/// Recovering. A `Required` corruption gates nothing, so the cursor-advancing
+/// arm returns the transition unchanged.
 #[test]
 fn corruption_in_awaiting_ready_triggers_recovery() {
     let (effects, state) = drive(
@@ -1406,8 +1406,8 @@ fn corruption_in_awaiting_ready_triggers_recovery() {
     assert!(effects.contains(&Effect::RecoverComponent { id: C0, attempt: 0 }));
 }
 
-/// CorruptionDetected while in Updating (required component) → Recovering
-/// via the SupervisingPlatform superstate handler.
+/// CorruptionDetected while in Updating (required component) → Recovering.
+/// Updating has its own arm; it discards the staged image on preemption.
 #[test]
 fn corruption_in_updating_triggers_recovery() {
     let (effects, state) = drive(
@@ -2124,10 +2124,9 @@ impl SplitMix64 {
 }
 
 /// Build a random three-component chain: kind, failure policy and dependency
-/// edge all vary per seed. A fixed shape hides whole classes of bug. The
-/// cursor-gating races only become reachable in `AwaitingReady` when a gateable
-/// component sits after an active one, which the old fixed chain never did, so
-/// the shape is part of what gets fuzzed.
+/// edge all vary per seed. The `AwaitingReady` cursor race needs a gateable
+/// component after an active one, which the old fixed chain never had, so the
+/// shape is part of what gets fuzzed.
 fn random_chain(rng: &mut SplitMix64) -> heapless::Vec<(ComponentId, ComponentAttrs), CAPACITY> {
     let ids = [C0, C1, C2];
     let mut c = heapless::Vec::new();
