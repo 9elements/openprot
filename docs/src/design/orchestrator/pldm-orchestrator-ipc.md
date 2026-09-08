@@ -139,15 +139,15 @@ use-after-transfer bugs but not a compromised process, because PLDM still has
 the underlying flash mapped. Whether Receiving carries an explicit base or the
 staging region is board-static is an open question (see below).
 
-The second layer is a hardware write filter that PLDM cannot reprogram. The
-SMC raises SmcInterrupt::WriteProtected on writes outside an allowed region. The orchestrator (or a dedicated flash-service process)
-opens the filter for the staging region on Offer and closes it on
-Complete/Abort/timeout. PLDM needs the SMC control registers that drive
-erase/program commands, but must not be able to touch the filter/write-protect
-registers. Whether those register sets are separable (distinct MPU pages,
-separate controller/CS, or lock-until-reset bits) depends on the AST10x0
-register layout and is folded into the "who owns the SPI flash controller"
-open question below.
+The second layer is a hardware write filter that PLDM cannot reprogram. The SMC
+raises SmcInterrupt::WriteProtected on writes outside an allowed region. The
+orchestrator (or a dedicated flash-service process) opens the filter for the
+staging region on Offer and closes it on Complete/Abort/timeout. PLDM needs the
+SMC control registers that drive erase/program commands, but must not be able
+to touch the filter/write-protect registers. Whether those register sets are
+separable (distinct MPU pages, separate controller/CS, or lock-until-reset
+bits) depends on the AST10x0 register layout and is folded into the "who owns
+the SPI flash controller" open question below.
 
 The net effect: bugs hit the Rust window check, a compromised process hits the
 hardware filter, and both "inactive slot only" and "only during an update" are
