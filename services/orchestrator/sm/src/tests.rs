@@ -1220,6 +1220,33 @@ fn gating_the_awaited_component_does_not_stall_the_walk() {
     assert!(effects.contains(&Effect::ReleaseReset(C2)));
 }
 
+/// A failure verdict in flight when the cascade gated the component does not
+/// drag it into recovery. The re-walk would skip it anyway, so recovering an
+/// isolated component costs a full chain re-walk and a RecoverComponent
+/// against a device that stays held.
+#[test]
+fn late_verification_failed_for_gated_component_is_dropped() {
+    let (effects, state) = drive(
+        chain(&[
+            (C0, ComponentAttrs::active_required()),
+            (C1, ComponentAttrs::passive_cascading()),
+            (C2, ComponentAttrs::passive_required().with_depends_on(C1)),
+            (C3, ComponentAttrs::passive_required()),
+        ]),
+        &[
+            BOOT,
+            Event::VerificationPassed(C0), // releases C0, cursor on C1
+            Event::CorruptionDetected(C1), // gates C1 -> C2, cursor moves to C3
+            Event::VerificationFailed(C1), // in flight before the gating
+        ],
+    );
+    assert_ne!(state, State::Recovering(C1), "isolated C1 entered recovery");
+    assert!(
+        !effects.contains(&Effect::RecoverComponent { id: C1, attempt: 0 }),
+        "RecoverComponent fired for isolated C1"
+    );
+}
+
 /// Runtime corruption under a non-`Required` policy reports too. This path
 /// never enters recovery at all, so without its own report the isolation would
 /// be silent.

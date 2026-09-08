@@ -554,6 +554,12 @@ impl<const N: usize, const E: usize> Rot<N, E> {
                     }
                 }
                 Event::VerificationFailed(id) => {
+                    // A verdict for a component the cascade already isolated is
+                    // in flight from before the gating: recovering it would
+                    // re-walk the chain for a device that stays held anyway.
+                    if self.is_gated(*id) {
+                        return Outcome::Handled;
+                    }
                     // Recovery is attempted first for every failure, regardless
                     // of the component's recovery-failure policy (CSA: recover
                     // first, classify only once retries are exhausted).
@@ -646,6 +652,11 @@ impl<const N: usize, const E: usize> Rot<N, E> {
                     }
                 }
                 Event::VerificationFailed(id) => {
+                    // Same in-flight verdict as above: an isolated component
+                    // does not enter recovery.
+                    if self.is_gated(*id) {
+                        return Outcome::Handled;
+                    }
                     // Recovery is attempted first for every failure, regardless
                     // of the component's recovery-failure policy.
                     Outcome::Transition(State::Recovering(*id))
