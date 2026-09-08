@@ -21,8 +21,8 @@ Design decisions:
 - Transfer loop is zero-IPC: PLDM writes firmware bytes direct to flash and
   tracks progress locally. Complete carries the byte count for the
   orchestrator's coverage check (early-fail only, verify hashes the staged
-  image anyway). On a write error PLDM can nudge and report Failed via Poll,
-  no extra IPC verb needed.
+  image anyway). On a write error PLDM sends Abort to release staging and
+  reports the failure to the UA in TransferComplete's result code.
 
 ```mermaid
 sequenceDiagram
@@ -96,7 +96,7 @@ sequenceDiagram
     Note right of Orch: activation effect (async):<br/>bump SVN in OTP (irreversible),<br/>nudge + Poll reports Activated
 
     Note over UA, Orch: between Offer and Activate
-    UA->>PLDM: CancelUpdate (MCTP, 0x1D)
+    UA->>PLDM: CancelUpdate (MCTP)
     activate PLDM
     PLDM->>Orch: Abort
     Note right of Orch: in-flight flash step completes<br/>and is discarded
@@ -106,5 +106,5 @@ sequenceDiagram
 
     Note over Orch: If PLDM dies mid-transfer (no Complete, no Abort),<br/>orchestrator-side timeout releases the staging reservation.
 
-    Note over UA, Flash: Blocking direction: always PLDM -> Orchestrator, never the reverse.<br/>Every IPC response is immediate. Effects run async via poll_stage (one step, return, repeat).<br/>PLDM stays free to service UA on MCTP. USER signal nudge replaces blind polling.<br/>FD initiates TransferComplete, VerifyComplete, ApplyComplete. UA initiates ActivateFirmware.
+    Note over UA, Flash: Blocking direction: always PLDM -> Orchestrator, never the reverse.<br/>Every IPC response is immediate. Effects run async via poll_stage (one step, return, repeat).<br/>PLDM stays free to service UA on MCTP. USER signal nudge replaces blind polling.<br/>FD initiates TransferComplete, VerifyComplete, ApplyComplete. UA initiates ActivateFirmware and CancelUpdate.
 ```
