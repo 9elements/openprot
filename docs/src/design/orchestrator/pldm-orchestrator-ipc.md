@@ -23,6 +23,14 @@ Design decisions:
 - A Rejected veto becomes an error completion code in the RequestUpdate
   response, ALREADY_IN_UPDATE_MODE when the reason is an update already
   running; the UA retries.
+- Activation reports, it does not roll back. The ActivateFirmware response
+  carries the spec's estimated_time and means accepted; the outcome of the SVN
+  bump reaches the UA as GetStatus AuxStateStatus (GenericError is the only
+  failure value the spec offers), and GetFirmwareParameters shows which version
+  is actually active. A failed activation leaves a bootable system, because
+  PLDM never writes the active image and staging is inert, so re-running the
+  update from RequestUpdate is always available. What the UA does with that is
+  the UA's.
 - Receiving carries the staging base address, not just the total. The
   orchestrator picks the region and programs the SMC write filter for it, so
   the window PLDM writes through and the window the hardware allows come from
@@ -135,12 +143,12 @@ transfer. Two layers, each catching a different class of failure:
 
 The first layer is a typed StagingWindow inside the PLDM process. When PLDM
 receives a Receiving response it constructs the window from the base and total
-it carries: a bounded handle over the staging region, capped to its length. All writes go
-through the window; it translates offsets and rejects anything outside the
-region. The window is dropped on Complete, Abort, or timeout, so PLDM holds
-no flash handle outside an active transfer. This catches offset bugs and
-use-after-transfer bugs but not a compromised process, because PLDM still has
-the underlying flash mapped.
+it carries: a bounded handle over the staging region, capped to its length. All
+writes go through the window; it translates offsets and rejects anything
+outside the region. The window is dropped on Complete, Abort, or timeout, so
+PLDM holds no flash handle outside an active transfer. This catches offset bugs
+and use-after-transfer bugs but not a compromised process, because PLDM still
+has the underlying flash mapped.
 
 The second layer is a hardware write filter that PLDM cannot reprogram. The SMC
 raises SmcInterrupt::WriteProtected on writes outside an allowed region. The
@@ -183,8 +191,3 @@ the zero-IPC transfer loop no transaction is in flight, so the orchestrator
 sees nothing. Replacing the timeout means the orchestrator waits on JOINABLE on
 PLDM's process object, or the supervisor that joins PLDM tells it. That is a
 supervisor question, not a channel one.
-
-The ActivateFirmware response says accepted, so the UA learns the outcome of
-the irreversible SVN bump only from GetStatus. If activation fails after the
-response, there is no rollback: the doc needs a line on what the UA is expected
-to do.
