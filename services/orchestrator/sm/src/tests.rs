@@ -2249,6 +2249,52 @@ fn random_event(rng: &mut SplitMix64, ids: &[ComponentId]) -> Event {
     }
 }
 
+/// Isolation is sticky: once a component is reported isolated, nothing in the
+/// rest of the run takes it out of reset or hands it to recovery. All four bugs
+/// in this class broke it: both cursor-gating races, the stale failure verdict,
+/// and the corruption report for a component already held. The
+/// verify-before-release property sees none of them, because recovery
+/// re-verifies before releasing.
+#[test]
+fn property_isolation_is_sticky_under_random_sequences() {
+    const RUNS: u64 = 20_000;
+    const MAX_LEN: u32 = 24;
+
+    let palette = [C0, C1, C2, C3];
+
+    for seed in 0..RUNS {
+        let mut rng = SplitMix64(seed.wrapping_mul(0xD1B5_4A32_D192_ED03).wrapping_add(1));
+
+        let ch = random_chain(&mut rng);
+        let mut orch =
+            Orchestrator::<CAPACITY, ECAP>::new(ch.try_into().expect("valid chain"), MAX_RETRY);
+        let mut platform = Recorder::new();
+
+        orch.dispatch(&mut platform, BOOT);
+        let len = 1 + rng.below(MAX_LEN);
+        for _ in 0..len {
+            let event = random_event(&mut rng, &palette);
+            orch.dispatch(&mut platform, event);
+        }
+
+        let mut isolated = [false; CAPACITY];
+        for effect in &platform.recorded {
+            match effect {
+                Effect::ReportIsolated(id) => isolated[id.get() as usize] = true,
+                Effect::ReleaseReset(id) => assert!(
+                    !isolated[id.get() as usize],
+                    "seed {seed}: released {id:?} after reporting it isolated",
+                ),
+                Effect::RecoverComponent { id, .. } => assert!(
+                    !isolated[id.get() as usize],
+                    "seed {seed}: recovered {id:?} after reporting it isolated",
+                ),
+                _ => {}
+            }
+        }
+    }
+}
+
 #[test]
 fn property_verify_before_release_holds_under_random_sequences() {
     const RUNS: u64 = 20_000;
