@@ -1158,6 +1158,69 @@ fn gating_the_rest_of_the_chain_in_awaiting_ready_ends_the_walk() {
     assert!(!effects.contains(&Effect::LatchLockdown));
 }
 
+/// The other half of the cursor rule: gating a component the cursor has not
+/// reached leaves the cursor alone, so C1's verdict still releases it. An
+/// unconditional advance would make that verdict a mismatch and leave a
+/// verified component in reset.
+#[test]
+fn cascade_in_awaiting_ready_below_the_cursor_leaves_it_alone() {
+    let (effects, state) = drive(
+        chain(&[
+            (C0, ComponentAttrs::active_required()),
+            (C1, ComponentAttrs::passive_required()),
+            (C2, ComponentAttrs::passive_cascading()),
+        ]),
+        &[
+            BOOT,
+            Event::VerificationPassed(C0), // releases C0, cursor on C1
+            Event::CorruptionDetected(C2), // gates C2, which the cursor has not reached
+            Event::VerificationPassed(C1), // C1 is still under verification
+        ],
+    );
+    assert_eq!(state, State::Ready);
+    // The cursor never left C1, so its verdict still counts.
+    assert!(effects.contains(&Effect::ReleaseReset(C1)));
+    // C2 is gated before its turn and the walk skips it.
+    assert!(effects.contains(&Effect::ReportIsolated(C2)));
+    assert!(!effects.contains(&Effect::ReleaseReset(C2)));
+    assert!(!effects.contains(&Effect::ReadFirmware(C2)));
+}
+
+/// The cascade gates the component the `AwaitingReady` slot waits on. The slot
+/// keeps naming it, which is harmless: `gate_one` cleared its `awaiting_boot`,
+/// a late `ComponentReady` releases nothing, and the walk reaches `Ready`
+/// through the cursor rather than through readiness.
+#[test]
+fn gating_the_awaited_component_does_not_stall_the_walk() {
+    let (effects, state) = drive(
+        chain(&[
+            (C0, ComponentAttrs::active_cascading()),
+            (C1, ComponentAttrs::passive_required().with_depends_on(C0)),
+            (C2, ComponentAttrs::passive_required()),
+        ]),
+        &[
+            BOOT,
+            Event::VerificationPassed(C0), // releases C0, awaits its readiness
+            Event::CorruptionDetected(C0), // gates the awaited C0 and C1
+            Event::ComponentReady(C0),     // in flight before the gating
+            Event::VerificationPassed(C1), // in flight before the gating
+            Event::VerificationPassed(C2),
+        ],
+    );
+    assert_eq!(state, State::Ready);
+    // C0 was live and goes back into reset; C1 goes with it. C1 had already
+    // been read and verified when C0's verdict advanced the cursor, so its own
+    // verdict is the one that must not release it.
+    assert!(effects.contains(&Effect::AssertReset(C0)));
+    for id in [C0, C1] {
+        assert!(effects.contains(&Effect::ReportIsolated(id)));
+    }
+    assert!(!effects.contains(&Effect::ReleaseReset(C1)));
+    // The walk moved past the isolated pair and finished on C2.
+    assert!(effects.contains(&Effect::ReadFirmware(C2)));
+    assert!(effects.contains(&Effect::ReleaseReset(C2)));
+}
+
 /// Runtime corruption under a non-`Required` policy reports too. This path
 /// never enters recovery at all, so without its own report the isolation would
 /// be silent.
