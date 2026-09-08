@@ -186,6 +186,24 @@ impl Default for ComponentStatus {
 /// default. `E` must be at least `2 * N + 2` (enforced in [`Rot::new`]).
 pub struct Rot<const N: usize, const E: usize> {
     chain: heapless::Vec<(ComponentId, ComponentAttrs), N>,
+    /// Index into `chain` of the component currently under verification, or the
+    /// past-the-end sentinel `chain.len()` once the walk is done. Release keys
+    /// off `chain[cursor]` alone: a `VerificationPassed` for any other id is
+    /// stale or out-of-turn and is dropped.
+    ///
+    /// While the walk runs (`PreSupervision` and `AwaitingReady`) the cursor
+    /// never points at a gated component. Gating the component under
+    /// verification therefore has to move the cursor past it, which is what
+    /// [`handle_corruption_advancing`](Self::handle_corruption_advancing) does:
+    /// a verdict already in flight then fails the `chain[cursor]` check and is
+    /// dropped, instead of releasing a component the cascade just isolated.
+    /// Leaving the cursor on a gated component is the shape all four bugs in
+    /// that family had, so `property_isolation_is_sticky_under_random_sequences`
+    /// guards it.
+    ///
+    /// `Recovering` is outside that: `VerificationFailed` leaves the cursor on
+    /// the failed component and a corruption report can gate it there. Entry to
+    /// `PreSupervision` re-walks from 0, which restores the invariant.
     cursor: u8,
     /// One record per chain component (parallel to `chain` by index). Each
     /// [`ComponentStatus`] holds the component's service `lifecycle` (`Isolated`
