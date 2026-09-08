@@ -1159,7 +1159,8 @@ fn gating_the_rest_of_the_chain_in_awaiting_ready_ends_the_walk() {
 /// The other half of the cursor rule: gating a component the cursor has not
 /// reached leaves the cursor alone, so C1's verdict still releases it. An
 /// unconditional advance would make that verdict a mismatch and leave a
-/// verified component in reset.
+/// verified component in reset. C3 depends on C2 so the cascade has a
+/// dependent to gate.
 #[test]
 fn cascade_in_awaiting_ready_below_the_cursor_leaves_it_alone() {
     let (effects, state) = drive(
@@ -1167,20 +1168,24 @@ fn cascade_in_awaiting_ready_below_the_cursor_leaves_it_alone() {
             (C0, ComponentAttrs::active_required()),
             (C1, ComponentAttrs::passive_required()),
             (C2, ComponentAttrs::passive_cascading()),
+            (C3, ComponentAttrs::passive_required().with_depends_on(C2)),
         ]),
         &[
             BOOT,
             Event::VerificationPassed(C0), // releases C0, cursor on C1
-            Event::CorruptionDetected(C2), // gates C2, which the cursor has not reached
+            Event::CorruptionDetected(C2), // cascade-gates C2 and C3, both below the cursor
             Event::VerificationPassed(C1), // C1 is still under verification
         ],
     );
     assert_eq!(state, State::Ready);
     // The cursor never left C1, so its verdict still counts.
     assert!(effects.contains(&Effect::ReleaseReset(C1)));
-    assert!(effects.contains(&Effect::ReportIsolated(C2)));
-    assert!(!effects.contains(&Effect::ReleaseReset(C2)));
-    assert!(!effects.contains(&Effect::ReadFirmware(C2)));
+    // C2 and C3 are gated before their turn and the walk skips them.
+    for id in [C2, C3] {
+        assert!(effects.contains(&Effect::ReportIsolated(id)));
+        assert!(!effects.contains(&Effect::ReleaseReset(id)));
+        assert!(!effects.contains(&Effect::ReadFirmware(id)));
+    }
 }
 
 /// The cascade gates the component the `AwaitingReady` slot waits on. The slot
