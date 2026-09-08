@@ -23,6 +23,10 @@ Design decisions:
 - A Rejected veto becomes an error completion code in the RequestUpdate
   response, ALREADY_IN_UPDATE_MODE when the reason is an update already
   running; the UA retries.
+- Receiving carries the staging base address, not just the total. The
+  orchestrator picks the region and programs the SMC write filter for it, so
+  the window PLDM writes through and the window the hardware allows come from
+  one place. PLDM holds no board layout.
 - Write access is two layers: a typed StagingWindow inside PLDM (Rust, catches
   offset bugs) backed by an SMC write filter PLDM cannot reprogram (catches a
   compromised process). The orchestrator opens the filter on Offer and closes
@@ -57,8 +61,8 @@ sequenceDiagram
 
     activate PLDM
     PLDM->>Orch: Offer { target: TargetId, total: u64 }
-    Note right of Orch: validate target + length,<br/>reserve staging
-    Orch-->>PLDM: IntakeStatus::Receiving { total }
+    Note right of Orch: validate target + length,<br/>reserve staging,<br/>open the SMC write filter
+    Orch-->>PLDM: IntakeStatus::Receiving { base: FlashAddress, total }
     deactivate PLDM
 
     loop FD pulls chunks from UA via RequestFirmwareData
@@ -130,14 +134,13 @@ access must be confined to the inactive slot and only for the duration of the
 transfer. Two layers, each catching a different class of failure:
 
 The first layer is a typed StagingWindow inside the PLDM process. When PLDM
-receives a Receiving response it constructs the window: a bounded handle over
-the inactive slot (base address + length, capped to slot size). All writes go
+receives a Receiving response it constructs the window from the base and total
+it carries: a bounded handle over the staging region, capped to its length. All writes go
 through the window; it translates offsets and rejects anything outside the
 region. The window is dropped on Complete, Abort, or timeout, so PLDM holds
 no flash handle outside an active transfer. This catches offset bugs and
 use-after-transfer bugs but not a compromised process, because PLDM still has
-the underlying flash mapped. Whether Receiving carries an explicit base or the
-staging region is board-static is an open question (see below).
+the underlying flash mapped.
 
 The second layer is a hardware write filter that PLDM cannot reprogram. The SMC
 raises SmcInterrupt::WriteProtected on writes outside an allowed region. The
@@ -170,12 +173,16 @@ register sets fall on separate MPU pages on the AST10x0 (datasheet needed)
 determines whether pw_kernel can enforce the split, or whether a dedicated
 flash-service process must own the entire SMC and proxy writes.
 
-Whether Receiving carries an explicit base address for the staging region or
-the region is board-static. The typed StagingWindow needs a base; today
-Receiving only carries total.
-
-Whether the kernel can tell the orchestrator that PLDM's channel closed. That
-would replace the transfer-time timeout, which has to be generous.
+How the orchestrator learns that PLDM died, short of the timeout. Abort is a
+message a live PLDM sends; the timeout covers the case where it can send
+nothing. pw_kernel has no peer-closed signal: the set is READABLE, WRITEABLE,
+ERROR, JOINABLE, USER and the interrupt bits. The one existing path is
+ChannelInitiatorObject::reset, which raises ERROR on the handler, and only if a
+transaction was in flight and only once someone joins the dead process. During
+the zero-IPC transfer loop no transaction is in flight, so the orchestrator
+sees nothing. Replacing the timeout means the orchestrator waits on JOINABLE on
+PLDM's process object, or the supervisor that joins PLDM tells it. That is a
+supervisor question, not a channel one.
 
 The ActivateFirmware response says accepted, so the UA learns the outcome of
 the irreversible SVN bump only from GetStatus. If activation fails after the
