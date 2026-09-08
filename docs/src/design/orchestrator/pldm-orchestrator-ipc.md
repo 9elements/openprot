@@ -11,13 +11,18 @@ Design decisions:
 - Activate is on the wire (ActivateFirmware from the UA), not implicit after
   staging.
 - Flash seam is async: poll_stage calls start_erase/start_program, returns,
-  checks is_busy on the next call. Uses FlashDriver's split API, not
-  BlockingFlash.
+  checks is_busy on the next call and then complete_op, which is where the
+  operation's error surfaces. Uses FlashDriver's split API, not BlockingFlash.
 - USER signal is level-triggered (verified from Pigweed kernel source): OR'd
   into the peer's active_signals bitfield, persists until lowered. No lost
   wakeups.
 - MCTP server (separate process) buffers 4 messages while PLDM is in a
-  transact. Overflow drops silently, no backpressure to the bus.
+  transact. Overflow drops silently, no backpressure to the bus. Recovery from
+  a dropped message is PLDM's, not this seam's: pldm-lib defaults FD_T1 (update
+  mode idle) to 120s and FD_T2 (RequestFirmwareData retry) to 5s.
+- A Rejected veto becomes an error completion code in the RequestUpdate
+  response, ALREADY_IN_UPDATE_MODE when the reason is an update already
+  running; the UA retries.
 - Transfer loop is zero-IPC: PLDM writes firmware bytes direct to flash and
   tracks progress locally. Complete carries the byte count for the
   orchestrator's coverage check (early-fail only, verify hashes the staged
@@ -92,8 +97,10 @@ sequenceDiagram
     PLDM->>Orch: Activate
     Orch-->>PLDM: IntakeStatus::Activating
     deactivate PLDM
-    PLDM-->>UA: ActivateFirmware response
+    PLDM-->>UA: ActivateFirmware response (accepted, not done)
     Note right of Orch: activation effect (async):<br/>bump SVN in OTP (irreversible),<br/>nudge + Poll reports Activated
+    UA->>PLDM: GetStatus (MCTP, until activation lands)
+    PLDM-->>UA: current state + AuxState
 
     Note over UA, Orch: between Offer and Activate
     UA->>PLDM: CancelUpdate (MCTP)
@@ -104,7 +111,25 @@ sequenceDiagram
     deactivate PLDM
     PLDM-->>UA: CancelUpdate response
 
-    Note over Orch: If PLDM dies mid-transfer (no Complete, no Abort),<br/>orchestrator-side timeout releases the staging reservation.
+    Note over Orch: If PLDM dies mid-transfer (no Complete, no Abort),<br/>orchestrator-side timeout releases the staging reservation.<br/>The transfer loop is zero-IPC, so this bounds total transfer time:<br/>it must exceed worst-case transfer plus FD_T1 (120s),<br/>so a live PLDM always aborts first.
 
-    Note over UA, Flash: Blocking direction: always PLDM -> Orchestrator, never the reverse.<br/>Every IPC response is immediate. Effects run async via poll_stage (one step, return, repeat).<br/>PLDM stays free to service UA on MCTP. USER signal nudge replaces blind polling.<br/>FD initiates TransferComplete, VerifyComplete, ApplyComplete. UA initiates ActivateFirmware and CancelUpdate.
+    Note over UA, Flash: Blocking direction: always PLDM -> Orchestrator, never the reverse.<br/>Every IPC response is immediate. Effects run async via poll_stage (one step, return, repeat).<br/>PLDM stays free to service UA on MCTP. USER signal nudge replaces blind polling.<br/>FD initiates TransferComplete, VerifyComplete, ApplyComplete. UA initiates ActivateFirmware, GetStatus and CancelUpdate.
 ```
+
+## Open questions
+
+Who owns the SPI flash controller. The diagram has PLDM writing the staging
+region and the orchestrator reading it, but FlashDriver takes `&mut self` and
+says nothing about multiple clients. Either each process drives its own
+controller over disjoint regions, or one process owns the driver and the other
+reaches it over IPC. Sequencing keeps the two off the same bytes at the same
+time (the orchestrator reads only after Complete), so this is about the driver
+and the controller, not about the protocol.
+
+Whether the kernel can tell the orchestrator that PLDM's channel closed. That
+would replace the transfer-time timeout, which has to be generous.
+
+The ActivateFirmware response says accepted, so the UA learns the outcome of
+the irreversible SVN bump only from GetStatus. If activation fails after the
+response, there is no rollback: the doc needs a line on what the UA is expected
+to do.
