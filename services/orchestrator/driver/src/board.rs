@@ -5,7 +5,7 @@
 //! Boards (or test mocks) implement these.
 
 use openprot_orchestrator_sm::{BootFailureKind, ComponentId, ComponentKind};
-use orchestrator_capabilities::Updatable;
+use orchestrator_capabilities::{IncrementalVerifier, PayloadSource, Updatable};
 
 pub use orchestrator_capabilities::{BootControl, BootWatch};
 use orchestrator_capabilities::{Recovery, Svn, SvnFloor};
@@ -183,6 +183,14 @@ pub trait BoardCapabilities {
     /// `()` for a board with no recovery path: every attempt reports
     /// source exhaustion immediately.
     type Recovery: Recovery;
+    /// The region an update source writes a candidate into, read by both
+    /// the authenticate and the stage phase. One region, because one
+    /// update runs at a time.
+    type Staging: PayloadSource;
+    /// Authenticates a staged candidate, one polled step per call. Not
+    /// [`Verifier`], which judges a boot image in one call: a candidate
+    /// is megabytes and the executor must return promptly.
+    type UpdateVerifier: IncrementalVerifier;
 }
 
 /// Who keeps one component's anti-rollback floor. Spelled as its own type
@@ -212,6 +220,8 @@ pub enum SvnFloorBinding<F: SvnFloor> {
 ///     type ReportSink = MctpReports;      // reports out over the management transport
 ///     type Updatable = PldmDevice;        // device pulls its own chunks
 ///     type Recovery = SlotRecovery;       // A/B + golden, attempt-indexed
+///     type Staging = StagingFlash;        // where the update source writes
+///     type UpdateVerifier = ChunkedManifestVerifier; // polled signature check
 /// }
 /// let board = Board::<Ast1060Board, 2> {
 ///     images: [bmc_image, cpld_image],
@@ -223,6 +233,8 @@ pub enum SvnFloorBinding<F: SvnFloor> {
 ///     report_sink,
 ///     updatables: [bmc_update, cpld_update],
 ///     recovery: [bmc_recovery, cpld_recovery],
+///     update_staging,
+///     update_verifier: Some(update_verifier),
 /// };
 /// ```
 pub struct Board<B: BoardCapabilities, const N: usize> {
@@ -255,4 +267,12 @@ pub struct Board<B: BoardCapabilities, const N: usize> {
     /// sources, same indexing as `images`. `()` for a board with no
     /// recovery path.
     pub recovery: [B::Recovery; N],
+    /// Where an update source leaves the candidate. Not per component:
+    /// the SM allows one update at a time, so one region serves all of
+    /// them.
+    pub update_staging: B::Staging,
+    /// The candidate verifier while no session is running. `None` means
+    /// the driver has a session in flight holding it; it comes back on a
+    /// verdict or on abandon. Wire it as `Some(..)` at bring-up.
+    pub update_verifier: Option<B::UpdateVerifier>,
 }

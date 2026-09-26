@@ -9,7 +9,8 @@ use openprot_orchestrator_sm::{
     Platform, PowerOnResult, State,
 };
 use orchestrator_capabilities::{
-    BootWatch, FailureCause, Recovery, RestoreOutcome, Svn, SvnFloor, WalkVerdict,
+    BootWatch, FailureCause, IncrementalVerifier, PayloadReadError, PayloadSource, PollOutcome,
+    Progress, Recovery, RestoreOutcome, Svn, SvnFloor, VerifySession, WalkVerdict,
 };
 
 const C0: ComponentId = ComponentId::new(0);
@@ -281,6 +282,7 @@ impl MockFloor {
 struct MockUpdatable {
     ready: bool,
     active: bool,
+    abandons: usize,
 }
 
 impl MockUpdatable {
@@ -288,7 +290,123 @@ impl MockUpdatable {
         Self {
             ready: false,
             active: false,
+            abandons: 0,
         }
+    }
+}
+
+/// The staging region: a fixed buffer an update source would have
+/// written into.
+struct MemStaging {
+    bytes: [u8; STAGING_LEN],
+}
+
+/// Room for the candidate plus slack, so a test can tell the region's
+/// length from the candidate's.
+const STAGING_LEN: usize = 64;
+
+/// What `mock_board` declares as its candidate length: shorter than the
+/// region, so the job's window has to be the thing that bounds reads.
+const CANDIDATE_LEN: u64 = 32;
+
+impl MemStaging {
+    fn new() -> Self {
+        Self {
+            bytes: core::array::from_fn(|i| i as u8),
+        }
+    }
+}
+
+impl PayloadSource for MemStaging {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), PayloadReadError> {
+        let start = offset as usize;
+        let end = start
+            .checked_add(buf.len())
+            .ok_or(PayloadReadError::OutOfRange)?;
+        if end > self.bytes.len() {
+            return Err(PayloadReadError::OutOfRange);
+        }
+        buf.copy_from_slice(&self.bytes[start..end]);
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CandidateVerifierFault;
+
+impl core::fmt::Display for CandidateVerifierFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("candidate verifier fault")
+    }
+}
+
+impl core::error::Error for CandidateVerifierFault {}
+
+/// Authenticates a candidate in fixed steps. Counts the polls so a test
+/// can tell one bounded step from a whole verification.
+#[derive(Debug, PartialEq, Eq)]
+struct MockCandidateVerifier {
+    polls: usize,
+}
+
+impl MockCandidateVerifier {
+    fn new() -> Self {
+        Self { polls: 0 }
+    }
+}
+
+/// Bytes one verify poll reads.
+const VERIFY_CHUNK: u64 = 8;
+
+#[derive(Debug, PartialEq, Eq)]
+struct MockVerifySession {
+    verifier: MockCandidateVerifier,
+    done: u64,
+}
+
+impl IncrementalVerifier for MockCandidateVerifier {
+    type Error = CandidateVerifierFault;
+    type Session = MockVerifySession;
+
+    fn start(self) -> MockVerifySession {
+        MockVerifySession {
+            verifier: self,
+            done: 0,
+        }
+    }
+}
+
+impl VerifySession for MockVerifySession {
+    type Verifier = MockCandidateVerifier;
+    type Error = CandidateVerifierFault;
+
+    fn poll(mut self, payload: &dyn PayloadSource) -> PollOutcome<Self> {
+        self.verifier.polls += 1;
+        let total = payload.len();
+        // An empty payload is a fault, never a vacuous Authenticated.
+        if total == 0 {
+            return PollOutcome::Fault(self.verifier, CandidateVerifierFault);
+        }
+        self.done = (self.done + VERIFY_CHUNK).min(total);
+        if self.done < total {
+            let progress = Progress {
+                done: self.done,
+                total,
+            };
+            return PollOutcome::Processing {
+                session: self,
+                progress,
+            };
+        }
+        PollOutcome::Authenticated(self.verifier)
+    }
+
+    fn abandon(self) -> MockCandidateVerifier {
+        self.verifier
     }
 }
 
@@ -323,6 +441,7 @@ impl orchestrator_capabilities::Updatable for MockUpdatable {
 
     fn abandon(&mut self) {
         self.ready = false;
+        self.abandons += 1;
     }
 
     fn activate(&mut self) -> Result<(), orchestrator_capabilities::UpdateError> {
@@ -346,6 +465,8 @@ impl BoardCapabilities for MockBoard {
     type ReportSink = RecordingSink;
     type Updatable = MockUpdatable;
     type Recovery = ();
+    type Staging = MemStaging;
+    type UpdateVerifier = MockCandidateVerifier;
 }
 
 /// The SVN `mock_board`'s verifier vouches for. Tests that read the floor
@@ -368,6 +489,8 @@ fn mock_board<const N: usize>() -> Board<MockBoard, N> {
         report_sink: RecordingSink::new(),
         updatables: core::array::from_fn(|_| MockUpdatable::new()),
         recovery: core::array::from_fn(|_| ()),
+        update_staging: MemStaging::new(),
+        update_verifier: Some(MockCandidateVerifier::new()),
     }
 }
 
@@ -596,6 +719,8 @@ impl BoardCapabilities for WatchBoard {
     type ReportSink = ();
     type Updatable = MockUpdatable;
     type Recovery = ();
+    type Staging = MemStaging;
+    type UpdateVerifier = MockCandidateVerifier;
 }
 
 // The at-rest guarantee end to end: the component is still held while its
@@ -622,6 +747,8 @@ fn release_follows_verification() {
         report_sink: (),
         updatables: [MockUpdatable::new()],
         recovery: [()],
+        update_staging: MemStaging::new(),
+        update_verifier: Some(MockCandidateVerifier::new()),
     });
     let mut orch = orchestrator();
 
@@ -967,6 +1094,8 @@ impl BoardCapabilities for RecoverableBoard {
     type ReportSink = RecordingSink;
     type Updatable = MockUpdatable;
     type Recovery = MockRecovery;
+    type Staging = MemStaging;
+    type UpdateVerifier = MockCandidateVerifier;
 }
 
 fn recoverable_board<const N: usize>(sources: u8) -> Board<RecoverableBoard, N> {
@@ -986,6 +1115,8 @@ fn recoverable_board<const N: usize>(sources: u8) -> Board<RecoverableBoard, N> 
             sources,
             fail_on: None,
         }),
+        update_staging: MemStaging::new(),
+        update_verifier: Some(MockCandidateVerifier::new()),
     }
 }
 
@@ -1296,7 +1427,7 @@ fn submit_update_refuses_an_unknown_component() {
     let mut driver = driver([MemImage::holding(valid_image())]);
 
     assert_eq!(
-        driver.submit_update(ComponentId::new(9)),
+        driver.submit_update(ComponentId::new(9), CANDIDATE_LEN),
         Err(DriverError::UnknownComponent)
     );
     assert_eq!(driver.pending_update(), None);
@@ -1308,16 +1439,20 @@ fn submit_update_refuses_an_unknown_component() {
 fn submit_update_refuses_a_second_in_flight() {
     let mut driver = driver([MemImage::holding(valid_image())]);
 
-    driver.submit_update(C0).unwrap();
-    assert_eq!(driver.submit_update(C0), Err(DriverError::UpdateBusy));
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
+    assert_eq!(
+        driver.submit_update(C0, CANDIDATE_LEN),
+        Err(DriverError::UpdateBusy)
+    );
     assert_eq!(driver.pending_update(), Some(C0));
 }
 
 // The frontend connection end to end: request_update records the job and
 // the SM receives UpdateRequest. Ready accepts it and enters Updating,
-// whose entry effects (AuthenticateUpdate, StageUpdate) have no executors
-// yet, so the machine latches Locked — that latch is the proof the event
-// arrived. Flips to an Updating/Ready assertion when the pump lands.
+// whose entry emits AuthenticateUpdate (which runs) then StageUpdate
+// (which has no executor yet), so the machine latches Locked — that latch
+// is the proof the event arrived. Flips to an Updating/Ready assertion
+// when the pump lands.
 #[test]
 fn request_update_reaches_the_sm() {
     let mut orch = orchestrator();
@@ -1325,7 +1460,7 @@ fn request_update_reaches_the_sm() {
     orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
     assert_eq!(orch.state(), State::Ready);
 
-    request_update(&mut orch, &mut driver, C0).unwrap();
+    request_update(&mut orch, &mut driver, C0, CANDIDATE_LEN).unwrap();
 
     assert_eq!(driver.pending_update(), Some(C0));
     assert_eq!(orch.state(), State::Locked);
@@ -1339,7 +1474,7 @@ fn refused_request_update_injects_no_event() {
     orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
 
     assert_eq!(
-        request_update(&mut orch, &mut driver, ComponentId::new(9)),
+        request_update(&mut orch, &mut driver, ComponentId::new(9), CANDIDATE_LEN),
         Err(DriverError::UnknownComponent)
     );
 
@@ -1347,12 +1482,99 @@ fn refused_request_update_injects_no_event() {
     assert_eq!(orch.state(), State::Ready);
 }
 
+// The candidate is described by the offer, not by the region it sits in:
+// a length past the end of the staging region is refused before anything
+// is recorded.
+#[test]
+fn submit_update_refuses_a_candidate_past_the_staging_region() {
+    let mut driver = driver([MemImage::holding(valid_image())]);
+
+    assert_eq!(
+        driver.submit_update(C0, STAGING_LEN as u64 + 1),
+        Err(DriverError::CandidateOutOfRange)
+    );
+    assert_eq!(driver.pending_update(), None);
+}
+
+// AuthenticateUpdate opens a session and returns: the verifier moves out
+// of the board, and no polling happens in the executor.
+#[test]
+fn authenticate_update_opens_a_session_without_polling() {
+    let mut driver = driver([MemImage::holding(valid_image())]);
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
+
+    driver.authenticate_update().expect("authenticate failed");
+
+    assert!(
+        driver.board().update_verifier.is_none(),
+        "the session holds the verifier"
+    );
+}
+
+// The job is recorded by the frontend before the SM emits anything, so an
+// authenticate with no job means the two have drifted apart.
+#[test]
+fn authenticate_update_without_a_job_is_refused() {
+    let mut driver = driver([MemImage::holding(valid_image())]);
+
+    assert_eq!(driver.authenticate_update(), Err(DriverError::NoUpdateJob));
+}
+
+// One session per job: the phase guard refuses a second start, which
+// would otherwise find the verifier already taken.
+#[test]
+fn authenticate_update_twice_is_refused() {
+    let mut driver = driver([MemImage::holding(valid_image())]);
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
+    driver.authenticate_update().unwrap();
+
+    assert_eq!(driver.authenticate_update(), Err(DriverError::NoUpdateJob));
+}
+
+// DiscardStaged is the SM's way back to Ready: the job is gone, the
+// device dropped what it staged, and the verifier is back on the board so
+// the next update can start a session.
+#[test]
+fn discard_staged_clears_the_job_and_returns_the_verifier() {
+    let mut driver = driver([MemImage::holding(valid_image())]);
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
+    driver.authenticate_update().unwrap();
+
+    driver.discard_staged().expect("discard failed");
+
+    assert_eq!(driver.pending_update(), None);
+    assert!(driver.board().update_verifier.is_some());
+    assert_eq!(driver.board().updatables[0].abandons, 1);
+}
+
+// Discarding before any session started still abandons the device: the
+// SM emits DiscardStaged for a rejection that happened in either phase.
+#[test]
+fn discard_staged_without_a_session_still_abandons_the_device() {
+    let mut driver = driver([MemImage::holding(valid_image())]);
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
+
+    driver.discard_staged().expect("discard failed");
+
+    assert_eq!(driver.pending_update(), None);
+    assert_eq!(driver.board().updatables[0].abandons, 1);
+}
+
+// Same drift as the authenticate case: the SM only emits DiscardStaged
+// with an update in flight.
+#[test]
+fn discard_staged_without_a_job_is_refused() {
+    let mut driver = driver([MemImage::holding(valid_image())]);
+
+    assert_eq!(driver.discard_staged(), Err(DriverError::NoUpdateJob));
+}
+
 // ReportUpdateDeferred clears pending_update so the next request is not
 // permanently blocked.
 #[test]
 fn deferred_report_clears_pending_update() {
     let mut driver = driver([MemImage::holding(valid_image())]);
-    driver.submit_update(C0).unwrap();
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
     assert_eq!(driver.pending_update(), Some(C0));
 
     driver.execute(Effect::ReportUpdateDeferred).unwrap();
@@ -1364,7 +1586,7 @@ fn deferred_report_clears_pending_update() {
     );
 
     // A subsequent submit succeeds: the slot is free.
-    driver.submit_update(C0).unwrap();
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
     assert_eq!(driver.pending_update(), Some(C0));
 }
 
@@ -1373,7 +1595,7 @@ fn deferred_report_clears_pending_update() {
 #[test]
 fn aborted_update_clears_pending_update() {
     let mut driver = driver([MemImage::holding(valid_image())]);
-    driver.submit_update(C0).unwrap();
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
 
     driver.execute(Effect::ReportUpdateAborted).unwrap();
 
@@ -1383,7 +1605,7 @@ fn aborted_update_clears_pending_update() {
         "aborted report must clear the pending job"
     );
 
-    driver.submit_update(C0).unwrap();
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
     assert_eq!(driver.pending_update(), Some(C0));
 }
 
