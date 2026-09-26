@@ -13,7 +13,8 @@ use crate::board::{
 };
 use orchestrator_capabilities::{
     BootControl, BootWatch, FailureCause, IncrementalVerifier, PayloadSource, PayloadWindow,
-    Recovery, RestoreOutcome, Svn, SvnFloor, Updatable, VerifySession, WalkVerdict,
+    PollOutcome, Progress, Recovery, RestoreOutcome, StageProgress, Svn, SvnFloor, Updatable,
+    VerifySession, WalkVerdict,
 };
 
 /// Why the driver could not carry out an effect.
@@ -38,6 +39,8 @@ pub enum DriverError {
     /// An update is already in flight; the frontend answers the requester
     /// over its own protocol, the SM never sees the refused request.
     UpdateBusy,
+    /// The device refused to activate what it staged.
+    UpdateFault,
     /// The recovery mechanism faulted (bus error, unreachable source).
     /// Distinct from source exhaustion, which is a verdict, not a fault.
     RecoveryFault,
@@ -61,6 +64,7 @@ impl core::fmt::Display for DriverError {
             DriverError::NoVerifiedImage => "no verified image to commit the floor to",
             DriverError::SvnFloorFault => "svn floor could not be advanced",
             DriverError::UpdateBusy => "an update is already in flight",
+            DriverError::UpdateFault => "device refused to activate the staged image",
             DriverError::RecoveryFault => "recovery mechanism faulted",
             DriverError::NoUpdateJob => "no update job for this effect",
             DriverError::CandidateOutOfRange => "candidate does not fit the staging region",
@@ -94,6 +98,18 @@ pub struct PlatformDriver<B: BoardCapabilities, const N: usize> {
     verify_session: Option<<B::UpdateVerifier as IncrementalVerifier>::Session>,
 }
 
+/// What one pump call established, before the stall rule is applied.
+enum Step {
+    /// The step ran and moved the job this far.
+    Working(Progress),
+    /// The candidate authenticated; staging is next.
+    Authenticated,
+    /// The device holds the complete payload.
+    Staged,
+    /// The candidate failed, or the device did.
+    Rejected,
+}
+
 /// One in-flight update, recorded by [`PlatformDriver::submit_update`].
 struct UpdateJob {
     target: ComponentId,
@@ -102,6 +118,17 @@ struct UpdateJob {
     /// carries what part of it holds this candidate.
     len: u64,
     phase: UpdatePhase,
+    /// Set by the `StageUpdate` executor. The SM emits it with
+    /// `AuthenticateUpdate` on entry to `Updating`, and the pump refuses
+    /// to push bytes to a device the SM never asked to stage.
+    stage_requested: bool,
+    /// Progress at the last pump call, and when it last moved. The pump
+    /// judges a stall against these; both phases count bytes the same
+    /// way, so one rule covers authentication and staging.
+    progress: Progress,
+    /// `None` until the first pump call: the job is recorded before the
+    /// event loop has a clock reading for it.
+    progress_since_millis: Option<u64>,
 }
 
 /// How far the in-flight update has come.
@@ -115,6 +142,12 @@ enum UpdatePhase {
     Submitted,
     /// A verify session is running over the candidate.
     Authenticating,
+    /// The candidate authenticated; `poll_stage` is pushing it to the
+    /// device.
+    Staging,
+    /// The device holds the complete payload. The SM has been told, and
+    /// the job waits for `ActivateUpdate` or `DiscardStaged`.
+    Staged,
 }
 
 impl<B: BoardCapabilities, const N: usize> PlatformDriver<B, N> {
@@ -163,6 +196,9 @@ impl<B: BoardCapabilities, const N: usize> PlatformDriver<B, N> {
             target,
             len,
             phase: UpdatePhase::Submitted,
+            stage_requested: false,
+            progress: Progress::none(len),
+            progress_since_millis: None,
         });
         Ok(())
     }
@@ -214,6 +250,194 @@ impl<B: BoardCapabilities, const N: usize> PlatformDriver<B, N> {
         self.verify_session = Some(verifier.start());
         job.phase = UpdatePhase::Authenticating;
         Ok(())
+    }
+
+    /// Records that the SM asked for staging. The transfer itself runs in
+    /// [`pump_update`](Self::pump_update), which refuses to touch a
+    /// device without this: the SM emits `StageUpdate` next to
+    /// `AuthenticateUpdate`, and a job missing one of the pair means the
+    /// two sides have drifted apart.
+    pub fn stage_update(&mut self) -> Result<(), DriverError> {
+        let job = self
+            .pending_update
+            .as_mut()
+            .ok_or(DriverError::NoUpdateJob)?;
+        job.stage_requested = true;
+        Ok(())
+    }
+
+    /// Activates the staged candidate: the device's next boot runs it,
+    /// tentatively. Clears the job, which has reached its end.
+    ///
+    /// The commit is not here. Activation proposes; `BootConfirmed` and
+    /// `CommitSvnFloor` decide.
+    pub fn activate_update(&mut self) -> Result<(), DriverError> {
+        let job = self
+            .pending_update
+            .as_ref()
+            .ok_or(DriverError::NoUpdateJob)?;
+        if job.phase != UpdatePhase::Staged {
+            return Err(DriverError::NoUpdateJob);
+        }
+        let target = job.target;
+        let updatable = self
+            .board
+            .updatables
+            .get_mut(target.get() as usize)
+            .ok_or(DriverError::UnknownComponent)?;
+        updatable.activate().map_err(|_| DriverError::UpdateFault)?;
+        // Only now: a refused activation leaves the job in flight, so the
+        // SM's DiscardStaged still finds it.
+        self.pending_update = None;
+        Ok(())
+    }
+
+    /// One step of the in-flight update, called by the event loop between
+    /// events, as [`poll_boot_walks`](Self::poll_boot_walks) is.
+    ///
+    /// Authentication runs first and staging follows, both one bounded
+    /// step per call, so the loop stays live through a transfer that
+    /// takes minutes. A job that stops making progress for longer than
+    /// the board's stall budget is abandoned here rather than waited out.
+    ///
+    /// The verdict travels as an event: `UpdateVerified` once the device
+    /// holds the complete payload, `UpdateRejected` for a candidate that
+    /// failed authentication, a device that faulted, or a stall. The
+    /// event is the SM's to act on; the job stays until the SM answers
+    /// with `ActivateUpdate` or `DiscardStaged`.
+    pub fn pump_update(&mut self, now_millis: u64) -> UpdatePoll {
+        let Some(job) = self.pending_update.as_mut() else {
+            return UpdatePoll::idle();
+        };
+        let since = *job.progress_since_millis.get_or_insert(now_millis);
+        let phase = job.phase;
+        let before = job.progress;
+
+        let stepped = match phase {
+            // Nothing to pump: the executors have not run, or the device
+            // already holds the payload and the SM owns the next move.
+            UpdatePhase::Submitted | UpdatePhase::Staged => return UpdatePoll::idle(),
+            UpdatePhase::Authenticating => self.poll_authentication(),
+            UpdatePhase::Staging => self.poll_staging(),
+        };
+
+        let step = match stepped {
+            Ok(step) => step,
+            Err(_) => return self.reject_job(),
+        };
+
+        let job = match self.pending_update.as_mut() {
+            Some(job) => job,
+            None => return UpdatePoll::idle(),
+        };
+        match step {
+            Step::Working(progress) => {
+                job.progress = progress;
+                if progress.done > before.done {
+                    job.progress_since_millis = Some(now_millis);
+                } else if now_millis.saturating_sub(since) >= self.board.update_stall_budget_millis
+                {
+                    return self.reject_job();
+                }
+                UpdatePoll {
+                    event: None,
+                    progress: Some(progress),
+                }
+            }
+            // Authentication passed. Staging starts on the next call, so
+            // this one stays a bounded step.
+            Step::Authenticated => {
+                job.phase = UpdatePhase::Staging;
+                job.progress = Progress::none(job.len);
+                job.progress_since_millis = Some(now_millis);
+                UpdatePoll {
+                    event: None,
+                    progress: Some(job.progress),
+                }
+            }
+            Step::Staged => {
+                job.phase = UpdatePhase::Staged;
+                UpdatePoll {
+                    event: Some(Event::UpdateVerified),
+                    progress: None,
+                }
+            }
+            Step::Rejected => self.reject_job(),
+        }
+    }
+
+    /// One verify poll over the candidate window. The session comes out
+    /// of the driver and goes back in unless it reached a verdict.
+    fn poll_authentication(&mut self) -> Result<Step, DriverError> {
+        let session = self.verify_session.take().ok_or(DriverError::NoUpdateJob)?;
+        let len = self
+            .pending_update
+            .as_ref()
+            .ok_or(DriverError::NoUpdateJob)?
+            .len;
+        let window = PayloadWindow::new(&self.board.update_staging, 0, len)
+            .map_err(|_| DriverError::CandidateOutOfRange)?;
+        match session.poll(&window) {
+            PollOutcome::Processing { session, progress } => {
+                self.verify_session = Some(session);
+                Ok(Step::Working(progress))
+            }
+            PollOutcome::Authenticated(verifier) => {
+                self.board.update_verifier = Some(verifier);
+                Ok(Step::Authenticated)
+            }
+            PollOutcome::Rejected(verifier) | PollOutcome::Fault(verifier, _) => {
+                self.board.update_verifier = Some(verifier);
+                Ok(Step::Rejected)
+            }
+        }
+    }
+
+    /// One staging step. Borrows the staging region and the device as
+    /// separate fields so the window can be read while the device writes.
+    fn poll_staging(&mut self) -> Result<Step, DriverError> {
+        let job = self
+            .pending_update
+            .as_ref()
+            .ok_or(DriverError::NoUpdateJob)?;
+        if !job.stage_requested {
+            return Err(DriverError::NoUpdateJob);
+        }
+        let (target, len) = (job.target, job.len);
+        let window = PayloadWindow::new(&self.board.update_staging, 0, len)
+            .map_err(|_| DriverError::CandidateOutOfRange)?;
+        let updatable = self
+            .board
+            .updatables
+            .get_mut(target.get() as usize)
+            .ok_or(DriverError::UnknownComponent)?;
+        match updatable.poll_stage(&window) {
+            Ok(StageProgress::Transferring(progress)) => Ok(Step::Working(progress)),
+            Ok(StageProgress::Ready) => Ok(Step::Staged),
+            Err(_) => Ok(Step::Rejected),
+        }
+    }
+
+    /// Ends the job the way the SM understands: the device drops what it
+    /// staged and the verdict travels as `UpdateRejected`. The job itself
+    /// stays until the SM answers with `DiscardStaged`, so the two sides
+    /// never disagree about whether an update is in flight.
+    fn reject_job(&mut self) -> UpdatePoll {
+        if let Some(session) = self.verify_session.take() {
+            self.board.update_verifier = Some(session.abandon());
+        }
+        if let Some(job) = self.pending_update.as_mut() {
+            job.phase = UpdatePhase::Submitted;
+            job.stage_requested = false;
+            let target = job.target.get() as usize;
+            if let Some(updatable) = self.board.updatables.get_mut(target) {
+                updatable.abandon();
+            }
+        }
+        UpdatePoll {
+            event: Some(Event::UpdateRejected),
+            progress: None,
+        }
     }
 
     /// Target of the in-flight update, if one was submitted.
@@ -410,6 +634,26 @@ impl<B: BoardCapabilities, const N: usize> PlatformDriver<B, N> {
 
 /// One [`PlatformDriver::poll_boot_walks`] round.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct UpdatePoll {
+    /// The verdict, once the job reached one. `UpdateVerified` when the
+    /// device holds the payload, `UpdateRejected` when the candidate, the
+    /// device or the stall budget ended it.
+    pub event: Option<Event>,
+    /// How far the job has come, for the update source's progress
+    /// report. `None` once there is nothing left to report.
+    pub progress: Option<Progress>,
+}
+
+impl UpdatePoll {
+    /// No job, or a job whose next move is the SM's.
+    const fn idle() -> Self {
+        Self {
+            event: None,
+            progress: None,
+        }
+    }
+}
+
 pub struct BootWalkPoll {
     /// The first terminal verdict's event; `None` when every watched walk
     /// is still waiting.
@@ -469,13 +713,12 @@ impl<B: BoardCapabilities, const N: usize> Platform for PlatformDriver<B, N> {
                 self.recover_component(id, attempt).map(Some)
             }
             Effect::AuthenticateUpdate => self.authenticate_update().map(|_| None),
+            Effect::StageUpdate => self.stage_update().map(|_| None),
+            Effect::ActivateUpdate => self.activate_update().map(|_| None),
             Effect::DiscardStaged => self.discard_staged().map(|_| None),
             // No board capability is composed for these seams yet, so they
             // fail closed here instead of behind stub methods.
-            Effect::StageUpdate
-            | Effect::ActivateUpdate
-            | Effect::SignAttestation
-            | Effect::LatchLockdown => return Err(EffectError),
+            Effect::SignAttestation | Effect::LatchLockdown => return Err(EffectError),
             // Emit is consumed by the orchestrator; receiving one is a
             // driver bug.
             Effect::Emit(_) => return Err(EffectError),

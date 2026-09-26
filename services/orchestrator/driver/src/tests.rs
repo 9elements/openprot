@@ -283,14 +283,52 @@ struct MockUpdatable {
     ready: bool,
     active: bool,
     abandons: usize,
+    /// Transferring steps before the device reports Ready.
+    steps: usize,
+    written: u64,
+    /// Answers Transferring forever without moving `written`: the stall
+    /// the pump's budget exists for.
+    stalls: bool,
+    /// Fails every step.
+    faults: bool,
 }
 
+/// Bytes one staging step writes.
+const STAGE_CHUNK: u64 = 8;
+
 impl MockUpdatable {
+    /// Reports Ready on the first step.
     fn new() -> Self {
         Self {
             ready: false,
             active: false,
             abandons: 0,
+            steps: 0,
+            written: 0,
+            stalls: false,
+            faults: false,
+        }
+    }
+
+    /// Transfers in `steps` steps before reporting Ready.
+    fn stepping(steps: usize) -> Self {
+        Self {
+            steps,
+            ..Self::new()
+        }
+    }
+
+    fn stalling() -> Self {
+        Self {
+            stalls: true,
+            ..Self::new()
+        }
+    }
+
+    fn faulting() -> Self {
+        Self {
+            faults: true,
+            ..Self::new()
         }
     }
 }
@@ -300,6 +338,9 @@ impl MockUpdatable {
 struct MemStaging {
     bytes: [u8; STAGING_LEN],
 }
+
+/// How long a job may make no progress before the pump abandons it.
+const STALL_BUDGET_MILLIS: u64 = 1_000;
 
 /// Room for the candidate plus slack, so a test can tell the region's
 /// length from the candidate's.
@@ -346,16 +387,31 @@ impl core::fmt::Display for CandidateVerifierFault {
 
 impl core::error::Error for CandidateVerifierFault {}
 
-/// Authenticates a candidate in fixed steps. Counts the polls so a test
-/// can tell one bounded step from a whole verification.
+/// What the candidate verifier decides once it has read the whole
+/// candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateVerdict {
+    Authentic,
+    Invalid,
+    Faulting,
+}
+
+/// Authenticates a candidate in fixed steps, with the verdict decided up
+/// front. Counts the polls so a test can tell one bounded step from a
+/// whole verification.
 #[derive(Debug, PartialEq, Eq)]
 struct MockCandidateVerifier {
+    verdict: CandidateVerdict,
     polls: usize,
 }
 
 impl MockCandidateVerifier {
     fn new() -> Self {
-        Self { polls: 0 }
+        Self::deciding(CandidateVerdict::Authentic)
+    }
+
+    fn deciding(verdict: CandidateVerdict) -> Self {
+        Self { verdict, polls: 0 }
     }
 }
 
@@ -402,7 +458,11 @@ impl VerifySession for MockVerifySession {
                 progress,
             };
         }
-        PollOutcome::Authenticated(self.verifier)
+        match self.verifier.verdict {
+            CandidateVerdict::Authentic => PollOutcome::Authenticated(self.verifier),
+            CandidateVerdict::Invalid => PollOutcome::Rejected(self.verifier),
+            CandidateVerdict::Faulting => PollOutcome::Fault(self.verifier, CandidateVerifierFault),
+        }
     }
 
     fn abandon(self) -> MockCandidateVerifier {
@@ -432,9 +492,31 @@ impl orchestrator_capabilities::SvnFloor for MockFloor {
 impl orchestrator_capabilities::Updatable for MockUpdatable {
     fn poll_stage(
         &mut self,
-        _payload: &dyn orchestrator_capabilities::PayloadSource,
+        payload: &dyn orchestrator_capabilities::PayloadSource,
     ) -> Result<orchestrator_capabilities::StageProgress, orchestrator_capabilities::UpdateError>
     {
+        if self.faults {
+            return Err(orchestrator_capabilities::UpdateError::Device);
+        }
+        let total = payload.len();
+        if self.stalls {
+            return Ok(orchestrator_capabilities::StageProgress::Transferring(
+                Progress {
+                    done: self.written,
+                    total,
+                },
+            ));
+        }
+        if self.steps > 0 {
+            self.steps -= 1;
+            self.written = (self.written + STAGE_CHUNK).min(total);
+            return Ok(orchestrator_capabilities::StageProgress::Transferring(
+                Progress {
+                    done: self.written,
+                    total,
+                },
+            ));
+        }
         self.ready = true;
         Ok(orchestrator_capabilities::StageProgress::Ready)
     }
@@ -491,6 +573,7 @@ fn mock_board<const N: usize>() -> Board<MockBoard, N> {
         recovery: core::array::from_fn(|_| ()),
         update_staging: MemStaging::new(),
         update_verifier: Some(MockCandidateVerifier::new()),
+        update_stall_budget_millis: STALL_BUDGET_MILLIS,
     }
 }
 
@@ -749,6 +832,7 @@ fn release_follows_verification() {
         recovery: [()],
         update_staging: MemStaging::new(),
         update_verifier: Some(MockCandidateVerifier::new()),
+        update_stall_budget_millis: STALL_BUDGET_MILLIS,
     });
     let mut orch = orchestrator();
 
@@ -1117,6 +1201,7 @@ fn recoverable_board<const N: usize>(sources: u8) -> Board<RecoverableBoard, N> 
         }),
         update_staging: MemStaging::new(),
         update_verifier: Some(MockCandidateVerifier::new()),
+        update_stall_budget_millis: STALL_BUDGET_MILLIS,
     }
 }
 
@@ -1448,11 +1533,9 @@ fn submit_update_refuses_a_second_in_flight() {
 }
 
 // The frontend connection end to end: request_update records the job and
-// the SM receives UpdateRequest. Ready accepts it and enters Updating,
-// whose entry emits AuthenticateUpdate (which runs) then StageUpdate
-// (which has no executor yet), so the machine latches Locked — that latch
-// is the proof the event arrived. Flips to an Updating/Ready assertion
-// when the pump lands.
+// the SM receives UpdateRequest. Ready accepts it, enters Updating, and
+// both entry effects run, so the machine waits there for the pump's
+// verdict instead of latching Locked.
 #[test]
 fn request_update_reaches_the_sm() {
     let mut orch = orchestrator();
@@ -1463,7 +1546,7 @@ fn request_update_reaches_the_sm() {
     request_update(&mut orch, &mut driver, C0, CANDIDATE_LEN).unwrap();
 
     assert_eq!(driver.pending_update(), Some(C0));
-    assert_eq!(orch.state(), State::Locked);
+    assert_eq!(orch.state(), State::Updating);
 }
 
 // A refused submit injects nothing: no job, no event, the SM stays Ready.
@@ -1645,4 +1728,322 @@ fn updatable_seam_is_satisfiable_by_the_mock() {
     );
     dev.activate().expect("activate failed");
     assert!(dev.active);
+}
+
+// ---------------------------------------------------------------------------
+// The update pump
+// ---------------------------------------------------------------------------
+
+/// A driver whose device and candidate verifier the test chooses.
+fn update_driver(
+    updatable: MockUpdatable,
+    verifier: MockCandidateVerifier,
+) -> PlatformDriver<MockBoard, 1> {
+    PlatformDriver::new(Board {
+        updatables: [updatable],
+        update_verifier: Some(verifier),
+        ..mock_board()
+    })
+}
+
+/// Submits a job and runs both entry executors, as entry to `Updating`
+/// does.
+fn updating(driver: &mut PlatformDriver<MockBoard, 1>) {
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
+    driver.authenticate_update().unwrap();
+    driver.stage_update().unwrap();
+}
+
+// Nothing in flight, nothing to do: the event loop may pump on every
+// tick.
+#[test]
+fn pumping_without_a_job_is_idle() {
+    let mut driver = driver([MemImage::holding(valid_image())]);
+
+    let poll = driver.pump_update(0);
+
+    assert_eq!(poll.event, None);
+    assert_eq!(poll.progress, None);
+}
+
+// A submitted job that no executor has touched is not pumped either:
+// entry to Updating is what starts the work.
+#[test]
+fn pumping_a_submitted_job_is_idle() {
+    let mut driver = driver([MemImage::holding(valid_image())]);
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
+
+    assert_eq!(driver.pump_update(0).event, None);
+}
+
+// Authentication is polled, not run to completion in one call: the
+// candidate is 32 bytes and the verifier reads 8 per poll.
+#[test]
+fn authentication_advances_one_bounded_step_per_pump() {
+    let mut driver = update_driver(MockUpdatable::new(), MockCandidateVerifier::new());
+    updating(&mut driver);
+
+    let first = driver.pump_update(0);
+
+    assert_eq!(first.event, None);
+    assert_eq!(
+        first.progress,
+        Some(Progress {
+            done: VERIFY_CHUNK,
+            total: CANDIDATE_LEN
+        })
+    );
+}
+
+// The whole flow with a device that stages in one step: authenticate,
+// stage, then the SM is told the payload is on the device.
+#[test]
+fn a_pumped_job_reaches_update_verified() {
+    let mut driver = update_driver(MockUpdatable::new(), MockCandidateVerifier::new());
+    updating(&mut driver);
+
+    let mut event = None;
+    for tick in 0..8 {
+        let poll = driver.pump_update(tick);
+        if let Some(e) = poll.event {
+            event = Some(e);
+            break;
+        }
+    }
+
+    assert_eq!(event, Some(Event::UpdateVerified));
+    assert!(driver.board().updatables[0].ready);
+    // The verifier came back when the session reached its verdict.
+    assert!(driver.board().update_verifier.is_some());
+}
+
+// Staging is polled too: a device that takes four steps is not waited
+// out inside one pump call.
+#[test]
+fn staging_advances_one_bounded_step_per_pump() {
+    let mut driver = update_driver(MockUpdatable::stepping(4), MockCandidateVerifier::new());
+    updating(&mut driver);
+
+    let mut polls = 0;
+    loop {
+        let poll = driver.pump_update(polls);
+        polls += 1;
+        if poll.event.is_some() {
+            break;
+        }
+        assert!(polls < 20, "pump never reached a verdict");
+    }
+
+    // 32 bytes at 8 per verify poll is 4 polls, the last of which also
+    // moves the job to staging; then 4 transfer steps and the Ready step.
+    assert_eq!(polls, 9);
+}
+
+// A candidate that fails authentication never reaches the device.
+#[test]
+fn a_rejected_candidate_is_never_staged() {
+    let mut driver = update_driver(
+        MockUpdatable::new(),
+        MockCandidateVerifier::deciding(CandidateVerdict::Invalid),
+    );
+    updating(&mut driver);
+
+    let mut event = None;
+    for tick in 0..8 {
+        if let Some(e) = driver.pump_update(tick).event {
+            event = Some(e);
+            break;
+        }
+    }
+
+    assert_eq!(event, Some(Event::UpdateRejected));
+    assert!(!driver.board().updatables[0].ready, "nothing was staged");
+    assert!(driver.board().update_verifier.is_some());
+}
+
+// A verifier that cannot run is the same answer as a bad candidate: the
+// platform is healthy, only the update failed.
+#[test]
+fn a_verifier_fault_rejects_the_update() {
+    let mut driver = update_driver(
+        MockUpdatable::new(),
+        MockCandidateVerifier::deciding(CandidateVerdict::Faulting),
+    );
+    updating(&mut driver);
+
+    let mut event = None;
+    for tick in 0..8 {
+        if let Some(e) = driver.pump_update(tick).event {
+            event = Some(e);
+            break;
+        }
+    }
+
+    assert_eq!(event, Some(Event::UpdateRejected));
+    assert!(driver.board().update_verifier.is_some());
+}
+
+// A device that fails a staging step ends the job the same way.
+#[test]
+fn a_device_fault_rejects_the_update() {
+    let mut driver = update_driver(MockUpdatable::faulting(), MockCandidateVerifier::new());
+    updating(&mut driver);
+
+    let mut event = None;
+    for tick in 0..8 {
+        if let Some(e) = driver.pump_update(tick).event {
+            event = Some(e);
+            break;
+        }
+    }
+
+    assert_eq!(event, Some(Event::UpdateRejected));
+    assert_eq!(driver.board().updatables[0].abandons, 1);
+}
+
+// A transfer that stops moving is abandoned once the budget is spent,
+// rather than held open for a device that stopped answering.
+#[test]
+fn a_stalled_transfer_is_rejected_at_the_budget() {
+    let mut driver = update_driver(MockUpdatable::stalling(), MockCandidateVerifier::new());
+    updating(&mut driver);
+
+    // Authentication (4 polls) and the phase change, all at t=0.
+    for _ in 0..5 {
+        assert_eq!(driver.pump_update(0).event, None);
+    }
+    // The device answers Transferring without moving.
+    assert_eq!(driver.pump_update(0).event, None);
+    assert_eq!(driver.pump_update(STALL_BUDGET_MILLIS - 1).event, None);
+
+    let poll = driver.pump_update(STALL_BUDGET_MILLIS);
+
+    assert_eq!(poll.event, Some(Event::UpdateRejected));
+    assert_eq!(driver.board().updatables[0].abandons, 1);
+}
+
+// Progress restarts the budget: a slow transfer that keeps moving is not
+// a stalled one.
+#[test]
+fn progress_restarts_the_stall_budget() {
+    let mut driver = update_driver(MockUpdatable::stepping(4), MockCandidateVerifier::new());
+    updating(&mut driver);
+
+    // One step per budget window: every call moves `written`, so the
+    // budget never runs out even though each step takes nearly all of it.
+    let mut tick = 0;
+    let mut event = None;
+    for _ in 0..12 {
+        tick += STALL_BUDGET_MILLIS - 1;
+        if let Some(e) = driver.pump_update(tick).event {
+            event = Some(e);
+            break;
+        }
+    }
+
+    assert_eq!(event, Some(Event::UpdateVerified));
+}
+
+// The SM emits StageUpdate next to AuthenticateUpdate. A job missing it
+// means the two sides drifted, so the pump refuses rather than pushing
+// bytes the SM never asked for.
+#[test]
+fn a_job_the_sm_never_asked_to_stage_is_rejected() {
+    let mut driver = update_driver(MockUpdatable::new(), MockCandidateVerifier::new());
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
+    driver.authenticate_update().unwrap();
+
+    // Authentication still completes; staging is where it stops.
+    let mut event = None;
+    for tick in 0..8 {
+        if let Some(e) = driver.pump_update(tick).event {
+            event = Some(e);
+            break;
+        }
+    }
+
+    assert_eq!(event, Some(Event::UpdateRejected));
+    assert!(!driver.board().updatables[0].ready);
+}
+
+// Activation is the SM's answer to UpdateVerified, and it only applies
+// to a job the device has actually staged.
+#[test]
+fn activate_update_requires_a_staged_job() {
+    let mut driver = update_driver(MockUpdatable::new(), MockCandidateVerifier::new());
+    updating(&mut driver);
+
+    assert_eq!(driver.activate_update(), Err(DriverError::NoUpdateJob));
+    assert_eq!(
+        driver.pending_update(),
+        Some(C0),
+        "the job survives, so DiscardStaged still finds it"
+    );
+}
+
+// The job ends at activation: the device runs the candidate on its next
+// boot, tentatively, and the driver is free for the next update.
+#[test]
+fn activate_update_ends_the_job() {
+    let mut driver = update_driver(MockUpdatable::new(), MockCandidateVerifier::new());
+    updating(&mut driver);
+    for tick in 0..8 {
+        if driver.pump_update(tick).event.is_some() {
+            break;
+        }
+    }
+
+    driver.activate_update().expect("activate failed");
+
+    assert!(driver.board().updatables[0].active);
+    assert_eq!(driver.pending_update(), None);
+}
+
+// The whole path through the SM: a request, the pump, the verdict, and
+// the activation the SM asks for in response.
+#[test]
+fn an_update_runs_from_request_to_activation() {
+    let mut orch = orchestrator();
+    let mut driver = update_driver(MockUpdatable::stepping(2), MockCandidateVerifier::new());
+    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
+    assert_eq!(orch.state(), State::Ready);
+
+    request_update(&mut orch, &mut driver, C0, CANDIDATE_LEN).unwrap();
+    assert_eq!(orch.state(), State::Updating);
+
+    for tick in 0..16 {
+        if let Some(event) = driver.pump_update(tick).event {
+            orch.dispatch(&mut driver, event);
+            break;
+        }
+    }
+
+    assert_eq!(orch.state(), State::Ready);
+    assert!(driver.board().updatables[0].active);
+    assert_eq!(driver.pending_update(), None);
+}
+
+// The rejection path through the SM: DiscardStaged runs and the platform
+// is back in Ready, still supervised.
+#[test]
+fn a_rejected_update_returns_the_platform_to_ready() {
+    let mut orch = orchestrator();
+    let mut driver = update_driver(
+        MockUpdatable::new(),
+        MockCandidateVerifier::deciding(CandidateVerdict::Invalid),
+    );
+    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
+
+    request_update(&mut orch, &mut driver, C0, CANDIDATE_LEN).unwrap();
+
+    for tick in 0..16 {
+        if let Some(event) = driver.pump_update(tick).event {
+            orch.dispatch(&mut driver, event);
+            break;
+        }
+    }
+
+    assert_eq!(orch.state(), State::Ready);
+    assert_eq!(driver.pending_update(), None, "DiscardStaged cleared it");
+    assert!(!driver.board().updatables[0].active);
 }

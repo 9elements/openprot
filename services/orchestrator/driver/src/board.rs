@@ -235,6 +235,7 @@ pub enum SvnFloorBinding<F: SvnFloor> {
 ///     recovery: [bmc_recovery, cpld_recovery],
 ///     update_staging,
 ///     update_verifier: Some(update_verifier),
+///     update_stall_budget_millis: 30_000,
 /// };
 /// ```
 pub struct Board<B: BoardCapabilities, const N: usize> {
@@ -275,4 +276,9 @@ pub struct Board<B: BoardCapabilities, const N: usize> {
     /// the driver has a session in flight holding it; it comes back on a
     /// verdict or on abandon. Wire it as `Some(..)` at bring-up.
     pub update_verifier: Option<B::UpdateVerifier>,
+    /// How long an update may make no progress before the pump abandons
+    /// it. Board policy, not the update source's: a device that stops
+    /// answering has to lose the job in bounded time whatever the source
+    /// would prefer.
+    pub update_stall_budget_millis: u64,
 }
