@@ -38,6 +38,10 @@
 //! need no session: a reset loses the observation that would judge them, so
 //! abandoning at boot gets the same result with no storage.
 //!
+//! `PayloadWindow` is an offset-and-length view over a `PayloadSource`:
+//! the staging region is board geometry, the candidate inside it is only
+//! as long as the offer said, and a reader must not run past it.
+//!
 //! `Progress` is the byte count every polled seam reports: staging and
 //! verification both answer with `done` out of `total`, so one stall
 //! rule covers both.
@@ -72,6 +76,7 @@ mod device_trial_boot;
 mod evidence;
 mod incremental_verifier;
 mod lockdown_latch;
+mod payload_window;
 mod progress;
 mod recovery;
 mod self_update;
@@ -84,6 +89,7 @@ pub use device_trial_boot::DeviceTrialBoot;
 pub use evidence::{BootStatus, EvidenceReader};
 pub use incremental_verifier::{IncrementalVerifier, PollOutcome, VerifySession};
 pub use lockdown_latch::LockdownLatch;
+pub use payload_window::PayloadWindow;
 pub use progress::Progress;
 pub use recovery::{Recovery, RestoreOutcome};
 pub use self_update::{trial_outcome, RunningImage, SelfUpdate, SelfUpdateState, TrialOutcome};
