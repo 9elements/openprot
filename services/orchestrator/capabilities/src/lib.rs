@@ -38,6 +38,10 @@
 //! need no session: a reset loses the observation that would judge them, so
 //! abandoning at boot gets the same result with no storage.
 //!
+//! `Progress` is the byte count every polled seam reports: staging and
+//! verification both answer with `done` out of `total`, so one stall
+//! rule covers both.
+//!
 //! `IncrementalVerifier` is the polled verification seam: `start`
 //! consumes the verifier into a `VerifySession` whose `poll` does one
 //! bounded hash step per call. See the trait docs for the full lifecycle.
@@ -68,6 +72,7 @@ mod device_trial_boot;
 mod evidence;
 mod incremental_verifier;
 mod lockdown_latch;
+mod progress;
 mod recovery;
 mod self_update;
 mod svn_floor;
@@ -79,6 +84,7 @@ pub use device_trial_boot::DeviceTrialBoot;
 pub use evidence::{BootStatus, EvidenceReader};
 pub use incremental_verifier::{IncrementalVerifier, PollOutcome, VerifySession};
 pub use lockdown_latch::LockdownLatch;
+pub use progress::Progress;
 pub use recovery::{Recovery, RestoreOutcome};
 pub use self_update::{trial_outcome, RunningImage, SelfUpdate, SelfUpdateState, TrialOutcome};
 pub use svn_floor::{Svn, SvnFloor};

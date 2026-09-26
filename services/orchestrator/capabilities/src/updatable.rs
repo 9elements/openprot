@@ -3,6 +3,8 @@
 
 //! The [`Updatable`] update capability contract.
 
+use crate::Progress;
+
 /// Update capability: stage a payload on one managed device and mark the
 /// staged image as its boot candidate.
 ///
@@ -47,11 +49,11 @@
 ///   [`poll_stage`](Self::poll_stage) call does one step, at most one
 ///   payload pull plus one device transaction, and returns without
 ///   waiting on the device. A busy device is not an error: the step
-///   returns [`Transferring`](StageProgress::Transferring) with `written`
+///   returns [`Transferring`](StageProgress::Transferring) with `done`
 ///   unchanged. So a single-threaded runtime stays live, the update
 ///   source gets progress, and abandoning mid-transfer is
 ///   [`abandon`](Self::abandon) instead of waiting out a blocked call.
-///   Liveness policy stays with the caller: it watches `written` and
+///   Liveness policy stays with the caller: it watches `done` and
 ///   abandons a transfer that stalls too long, on its own clock.
 /// - **`Ready` means ready.** The device holds the complete payload,
 ///   verified to its archetype's discipline: a direct-flash adapter
@@ -68,7 +70,7 @@ pub trait Updatable {
     ///
     /// A step is bounded: at most one pull from `payload` and at most one
     /// device transaction, never a wait for device progress. Returning
-    /// with `written` unchanged is legal (busy device, PLDM retransmit) and
+    /// with `done` unchanged is legal (busy device, PLDM retransmit) and
     /// is not an error.
     ///
     /// The first call from idle (fresh device, after [`Ready`], an error,
@@ -117,17 +119,11 @@ pub trait Updatable {
 /// breaking change, so every consumer handles it explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageProgress {
-    /// Transfer ongoing; poll again. `written`/`total` bytes feed the Update
-    /// Source's progress report.
-    Transferring {
-        /// Bytes written to the device so far. Monotonic and below `total`,
-        /// but free to hold still across calls (busy device,
-        /// retransmit); a caller deciding when a transfer has stalled
-        /// keys on this value.
-        written: u64,
-        /// Total payload bytes.
-        total: u64,
-    },
+    /// Transfer ongoing; poll again. The byte counts feed the Update
+    /// Source's progress report. `done` is bytes written to the device,
+    /// free to hold still across calls (busy device, retransmit); a
+    /// caller deciding when a transfer has stalled keys on that value.
+    Transferring(Progress),
     /// The device holds the complete, verified payload; `activate` may
     /// be called.
     Ready,
@@ -318,10 +314,10 @@ mod tests {
                 self.ready = true;
                 Ok(StageProgress::Ready)
             } else {
-                Ok(StageProgress::Transferring {
-                    written: self.count as u64,
+                Ok(StageProgress::Transferring(Progress {
+                    done: self.count as u64,
                     total: total as u64,
-                })
+                }))
             }
         }
 
@@ -370,10 +366,10 @@ mod tests {
         while pulled < payload.len() {
             assert_eq!(
                 dev.poll_stage(&payload),
-                Ok(StageProgress::Transferring {
-                    written: pulled,
-                    total: payload.len(),
-                })
+                Ok(StageProgress::Transferring(Progress {
+                    done: pulled,
+                    total: payload.len()
+                }))
             );
             pulled += MOCK_STEP as u64;
         }
@@ -421,10 +417,10 @@ mod tests {
         // A fresh transfer starts from byte zero.
         assert_eq!(
             dev.poll_stage(&payload),
-            Ok(StageProgress::Transferring {
-                written: MOCK_STEP as u64,
-                total: payload.len(),
-            })
+            Ok(StageProgress::Transferring(Progress {
+                done: MOCK_STEP as u64,
+                total: payload.len()
+            }))
         );
     }
 
@@ -457,10 +453,10 @@ mod tests {
             ) -> Result<StageProgress, UpdateError> {
                 self.busy = !self.busy;
                 if self.busy {
-                    return Ok(StageProgress::Transferring {
-                        written: self.inner.count as u64,
+                    return Ok(StageProgress::Transferring(Progress {
+                        done: self.inner.count as u64,
                         total: payload.len(),
-                    });
+                    }));
                 }
                 self.inner.poll_stage(payload)
             }
@@ -487,7 +483,7 @@ mod tests {
         loop {
             match dev.poll_stage(&payload).expect("staging failed") {
                 StageProgress::Ready => break,
-                StageProgress::Transferring { written, .. } => {
+                StageProgress::Transferring(Progress { done: written, .. }) => {
                     if written > last_written {
                         last_written = written;
                         stalled_polls = 0;
@@ -572,10 +568,10 @@ mod tests {
             if self.offset == total {
                 self.verifying = true;
             }
-            Ok(StageProgress::Transferring {
-                written: self.offset as u64,
+            Ok(StageProgress::Transferring(Progress {
+                done: self.offset as u64,
                 total: total as u64,
-            })
+            }))
         }
 
         fn abandon(&mut self) {
@@ -605,34 +601,28 @@ mod tests {
 
         assert_eq!(
             dev.poll_stage(&payload),
-            Ok(StageProgress::Transferring {
-                written: chunk,
-                total
-            })
+            Ok(StageProgress::Transferring(Progress { done: chunk, total }))
         );
         assert_eq!(
             dev.poll_stage(&payload),
-            Ok(StageProgress::Transferring {
-                written: 2 * chunk,
-                total,
-            })
+            Ok(StageProgress::Transferring(Progress {
+                done: 2 * chunk,
+                total
+            }))
         );
         // The retransmit step pulls again but holds `written` still.
         assert_eq!(
             dev.poll_stage(&payload),
-            Ok(StageProgress::Transferring {
-                written: 2 * chunk,
-                total,
-            })
+            Ok(StageProgress::Transferring(Progress {
+                done: 2 * chunk,
+                total
+            }))
         );
         // The short last chunk completes the transfer. Still not `Ready`:
         // the device's verify has not run.
         assert_eq!(
             dev.poll_stage(&payload),
-            Ok(StageProgress::Transferring {
-                written: total,
-                total
-            })
+            Ok(StageProgress::Transferring(Progress { done: total, total }))
         );
         // The verify step earns `Ready`.
         assert_eq!(dev.poll_stage(&payload), Ok(StageProgress::Ready));
@@ -711,20 +701,20 @@ mod tests {
                     self.ready = true;
                     Ok(StageProgress::Ready)
                 } else {
-                    Ok(StageProgress::Transferring {
-                        written: self.count as u64,
+                    Ok(StageProgress::Transferring(Progress {
+                        done: self.count as u64,
                         total: total as u64,
-                    })
+                    }))
                 };
             }
             let sector = self.count / FLASH_SECTOR;
             if !self.erased[sector] {
                 self.slot[sector * FLASH_SECTOR..(sector + 1) * FLASH_SECTOR].fill(0xff);
                 self.erased[sector] = true;
-                return Ok(StageProgress::Transferring {
-                    written: self.count as u64,
+                return Ok(StageProgress::Transferring(Progress {
+                    done: self.count as u64,
                     total: total as u64,
-                });
+                }));
             }
             let end = (self.count + FLASH_PAGE).min(total);
             let mut page = vec![0; end - self.count];
@@ -738,10 +728,10 @@ mod tests {
                 start: self.count,
                 expected: page,
             });
-            Ok(StageProgress::Transferring {
-                written: self.count as u64,
+            Ok(StageProgress::Transferring(Progress {
+                done: self.count as u64,
                 total: total as u64,
-            })
+            }))
         }
 
         fn abandon(&mut self) {
@@ -785,7 +775,10 @@ mod tests {
         for written in expected {
             assert_eq!(
                 dev.poll_stage(&payload),
-                Ok(StageProgress::Transferring { written, total })
+                Ok(StageProgress::Transferring(Progress {
+                    done: written,
+                    total
+                }))
             );
         }
         // The final readback completes staging.

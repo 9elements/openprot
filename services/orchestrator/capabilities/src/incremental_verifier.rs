@@ -3,7 +3,7 @@
 
 //! The [`IncrementalVerifier`] update-verification capability contract.
 
-use crate::PayloadSource;
+use crate::{PayloadSource, Progress};
 
 /// Factory for incremental verification sessions. Call [`start`] to
 /// begin hashing a candidate image; the returned [`VerifySession`] does
@@ -40,7 +40,7 @@ pub trait IncrementalVerifier: Sized {
 /// size is implementor-chosen, sized so each poll fits the caller's
 /// per-poll time budget.
 ///
-/// The caller watches progress via `done` in
+/// The caller watches `progress.done` in
 /// [`Processing`](PollOutcome::Processing) and abandons a session that
 /// stalls, on its own budget; the session never judges liveness.
 ///
@@ -71,9 +71,9 @@ pub trait VerifySession: Sized {
 /// the verifier, ready for a new [`start`](IncrementalVerifier::start).
 #[derive(Debug)]
 pub enum PollOutcome<S: VerifySession> {
-    /// One chunk processed. `done` bytes so far out of `total`.
-    /// The session is inside, ready for the next poll.
-    Processing { session: S, done: u64, total: u64 },
+    /// One chunk processed. The session is inside, ready for the next
+    /// poll.
+    Processing { session: S, progress: Progress },
     /// The complete image authenticated (signature and policy checks
     /// passed).
     Authenticated(S::Verifier),
@@ -167,8 +167,7 @@ mod tests {
             let total = self.total;
             PollOutcome::Processing {
                 session: self,
-                done,
-                total,
+                progress: Progress { done, total },
             }
         }
 
@@ -202,24 +201,24 @@ mod tests {
         // 4 bytes, 4 bytes, 2 bytes = 3 Processing steps, then verdict.
         let PollOutcome::Processing {
             session,
-            done: 4,
-            total: 10,
+            progress: Progress { done: 4, total: 10 },
         } = session.poll(&payload)
         else {
             panic!("expected Processing");
         };
         let PollOutcome::Processing {
             session,
-            done: 8,
-            total: 10,
+            progress: Progress { done: 8, total: 10 },
         } = session.poll(&payload)
         else {
             panic!("expected Processing");
         };
         let PollOutcome::Processing {
             session,
-            done: 10,
-            total: 10,
+            progress: Progress {
+                done: 10,
+                total: 10,
+            },
         } = session.poll(&payload)
         else {
             panic!("expected Processing");
@@ -305,8 +304,7 @@ mod tests {
         let session = ChunkedVerifier.start();
         let PollOutcome::Processing {
             session,
-            done: 4,
-            total: 12,
+            progress: Progress { done: 4, total: 12 },
         } = session.poll(&FailsAfterFirstChunk)
         else {
             panic!("expected Processing");
