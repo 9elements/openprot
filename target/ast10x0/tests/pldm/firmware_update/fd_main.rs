@@ -4,8 +4,8 @@
 //! PLDM Firmware Device app (the RoT).
 //!
 //! Runs the real [`FirmwareDevice`] state machine against the update agent on
-//! the mock BMC over MCTP/I2C2, streams the image it is handed into the BMC's
-//! boot flash on FMC chip select 1, and reads it back. The demo's claim is that
+//! the mock BMC over MCTP/I2C2, streams the image it is handed into the shared
+//! staging flash on SPI1 chip select 0, and reads it back. The demo's claim is that
 //! the bytes the update agent sent are the bytes now sitting in flash, and that
 //! activating the update resets the BMC so it would boot them.
 
@@ -15,8 +15,10 @@
 use core::cell::{Cell, RefCell};
 use core::time::Duration;
 
+use ast10x0_board::apply_spim_external_mux;
 use ast10x0_peripherals::create_pins;
 use ast10x0_peripherals::gpio::{bind_gpio, GpioBlock};
+use ast10x0_peripherals::scu::{ScuExtMuxSelect, ScuRegisters, SpiMonitorInstance};
 use flash_backend::NoWaitBlocking;
 use hal_flash::{BlockingFlash, Flash, FlashAddress};
 use openprot_hal_blocking::gpio_port::ActivePolarity;
@@ -51,10 +53,10 @@ use util_error::ErrorCode;
 use util_region::Region;
 
 use app_pldm_fd::handle;
-use app_pldm_fd_regions::{take_mmaps, FmcCs0Window, FmcCs1Window, FmcRegs};
+use app_pldm_fd_regions::{take_mmaps, Spi1Cs0Window, Spi1Regs};
 
-/// The FMC backend bound to this process's register mapping.
-type Backend = flash_backend::Backend<FmcRegs>;
+/// The SPI1 backend bound to this process's register mapping.
+type Backend = flash_backend::Ast10x0Spi1FlashDriver<Spi1Regs>;
 
 /// This board's EID, matching the MCTP server app underneath it.
 const FD_EID: u8 = 8;
@@ -79,7 +81,7 @@ const COMP_IDENTIFIER: u16 = 0x0001;
 const ACTIVE_COMP_VERSION: &str = "v0.9";
 const ACTIVE_IMAGE_SET_VERSION: &str = "openprot-demo-v0.9";
 
-/// Where the image lands on CS1, standing in for the BMC's boot flash. Scratch
+/// Where the image lands on the shared staging flash. Scratch
 /// region, sector-aligned, and clobbered without backup — persisting the image
 /// is the point of the test.
 const IMAGE_BASE: u32 = 0x10_0000;
@@ -239,7 +241,7 @@ fn expected_byte(offset: usize) -> u8 {
     (offset % 251) as u8
 }
 
-/// Firmware-device operations for the demo: program the image into CS1 as it
+/// Firmware-device operations for the demo: program the image into SPI1 CS0 as it
 /// arrives, then read it back.
 ///
 /// `FdOps` takes `&self` throughout, so the flash handle lives behind a
@@ -432,6 +434,15 @@ impl FdOps for DemoFdOps {
 
         self.verified.set(true);
         pw_log::info!("FD: image verified in flash, {} bytes", IMAGE_SIZE as u32);
+
+        // Last flash access on this side, so hand the staging flash to the mock
+        // BMC: release SPIM0's input from our SPI1 master, then flip the
+        // fixture-level select. Passthrough stays on; that is the BMC's path.
+        // SAFETY: this process holds the SCU mapping and is its only writer.
+        let scu = unsafe { ScuRegisters::new_global_unlocked() };
+        scu.clear_spim_internal_master_route();
+        apply_spim_external_mux(SpiMonitorInstance::Spim0, ScuExtMuxSelect::Mux0);
+
         Ok(VerifyResult::VerifySuccess)
     }
 
@@ -461,21 +472,21 @@ impl FdOps for DemoFdOps {
     }
 }
 
-/// Bring up the FMC and clear the sector the image lands in.
+/// Bring up SPI1 and clear the sector the image lands in.
 fn init_flash(
-    fmc_regs: Region<FmcRegs>,
-    fmc_cs0_window: Region<FmcCs0Window>,
-    fmc_cs1_window: Region<FmcCs1Window>,
+    spi1_regs: Region<Spi1Regs>,
+    spi1_cs0_window: Region<Spi1Cs0Window>,
 ) -> Result<BlockingFlash<Backend, NoWaitBlocking>, ErrorCode> {
-    // The kernel target applied the FMC pinmux before any process started.
-    let driver = Backend::new(fmc_regs, fmc_cs0_window, fmc_cs1_window)?;
+    // The kernel target applied the SPI1 pinmux and the SPIM0 route to the BMC
+    // flash before any process started.
+    let driver = Backend::new(spi1_regs, spi1_cs0_window)?;
     let mut flash = BlockingFlash {
         driver,
         blocking: NoWaitBlocking,
     };
     let (capacity, sector, _) = flash.geometry()?;
     pw_log::info!(
-        "FD: CS1 is {} bytes, {} byte sectors",
+        "FD: SPI1 CS0 is {} bytes, {} byte sectors",
         capacity.get() as u32,
         sector.get() as u32
     );
@@ -487,7 +498,7 @@ fn init_flash(
 fn entry() {
     // SAFETY: mints this process's memory mappings once, at its entry point.
     let mmaps = unsafe { take_mmaps() };
-    let flash = match init_flash(mmaps.fmc_regs, mmaps.fmc_cs0_window, mmaps.fmc_cs1_window) {
+    let flash = match init_flash(mmaps.spi1_regs, mmaps.spi1_cs0_window) {
         Ok(flash) => flash,
         Err(e) => {
             pw_log::error!("FD: flash init failed: {:08x}", e.0.get() as u32);

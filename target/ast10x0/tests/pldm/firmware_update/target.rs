@@ -14,8 +14,73 @@ use target_common::{declare_target, TargetInterface};
 
 pub struct Target;
 
-static PINCTRL_GROUPS: [&[ast10x0_peripherals::scu::PinctrlPin]; 2] =
-    [pinctrl::PINCTRL_I2C2, pinctrl::PINCTRL_FMC_QUAD];
+static PINCTRL_GROUPS: [&[ast10x0_peripherals::scu::PinctrlPin]; 3] = [
+    pinctrl::PINCTRL_I2C2,
+    pinctrl::PINCTRL_FMC_QUAD,
+    pinctrl::PINCTRL_SPI1_QUAD,
+];
+
+/// Give the SPI1 master a standing path to the staging flash through SPIM0.
+///
+/// Parking the route here is what lets the staging app drive the flash with
+/// plain SPI-NOR commands: `SpiTransaction` only touches the SCU when a caller
+/// names a `SpiMonitorInstance`, which `SpiNorFlash` never does. The mock BMC
+/// is held in reset for the duration so only one master is on the bus.
+#[cfg(feature = "rot")]
+fn park_spi1_to_staging_flash() -> bool {
+    use ast10x0_board::{
+        apply_spim_external_mux, apply_spim_pinctrl, enable_flash_power, release_spi_flash_resets,
+        set_bmc_resets,
+    };
+    use ast10x0_peripherals::scu::{
+        ScuExtMuxSelect, ScuRegisters, SpiMonitorInstance, SpiMonitorPassthrough, SpiMonitorSource,
+    };
+
+    const SPIM: SpiMonitorInstance = SpiMonitorInstance::Spim0;
+
+    // SAFETY: kernel main() runs once with exclusive hardware ownership.
+    let scu = unsafe { ScuRegisters::new_global_unlocked() };
+
+    if !enable_flash_power(&scu) || !release_spi_flash_resets() || !set_bmc_resets(true) {
+        return false;
+    }
+
+    apply_spim_pinctrl(&scu, SPIM);
+    scu.disable_spim_cs_internal_pull_down(SPIM);
+    scu.set_spim_passthrough(SPIM, SpiMonitorPassthrough::Enabled);
+    apply_spim_external_mux(SPIM, ScuExtMuxSelect::Mux1);
+    scu.set_spim_internal_mux(SpiMonitorSource::Spi1, SPIM as u8 + 1)
+        .is_ok()
+}
+
+/// Point the mock BMC's SPI1 master at the staging flash so the UA can read
+/// back what the RoT staged.
+///
+/// A plain SPI1 master: clock and data leave on this chip's own pins, but chip
+/// select still runs through the module-local mux, so that has to point at SPI1
+/// or the flash never sees CS assert. The fixture-level select stays untouched —
+/// the RoT owns it, and two chips driving one line would fight.
+#[cfg(not(feature = "rot"))]
+fn park_spi1_to_staging_flash() -> bool {
+    use ast10x0_board::apply_spim_module_mux;
+    use ast10x0_peripherals::scu::{
+        ScuExtMuxSelect, ScuRegisters, SpiMonitorInstance, SpiMonitorSource,
+    };
+
+    // SAFETY: kernel main() runs once with exclusive hardware ownership.
+    let scu = unsafe { ScuRegisters::new_global_unlocked() };
+
+    if scu
+        .set_spim_internal_mux(SpiMonitorSource::Spi1, 0)
+        .is_err()
+    {
+        return false;
+    }
+
+    scu.apply_pinctrl_group(pinctrl::PINCTRL_GPIOB4);
+    apply_spim_module_mux(SpiMonitorInstance::Spim0, ScuExtMuxSelect::Mux1);
+    true
+}
 
 impl TargetInterface for Target {
     const NAME: &'static str = "AST10x0 PLDM firmware update";
@@ -51,6 +116,11 @@ impl TargetInterface for Target {
         // binary is shared; each userspace app binds only the half its board needs.
         scu::route(&pins.scu414_28.into_gpio(&gpio));
         scu::route(&pins.scu414_29.into_gpio(&gpio));
+
+        if !park_spi1_to_staging_flash() {
+            let _ = console_backend_write_all(b"SPI1 staging path setup failed\r\n");
+            loop {}
+        }
 
         codegen::start();
         loop {}

@@ -116,6 +116,18 @@
                             start_address: 0x7e780000,
                             size_bytes: 0x1000,
                         },
+                        {
+                            name: "spi1_regs",
+                            type: "device",
+                            start_address: 0x7e630000,
+                            size_bytes: 0x1000,
+                        },
+                        {
+                            name: "spi1_cs0_window",
+                            type: "device",
+                            start_address: 0x90000000,
+                            size_bytes: 0x04000000,
+                        },
                     ],
                 },
             ],

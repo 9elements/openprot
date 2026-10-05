@@ -18,9 +18,11 @@
 
 use core::cell::Cell;
 
-use app_pldm_ua_regions::take_mmaps;
+use app_pldm_ua_regions::{take_mmaps, Spi1Cs0Window, Spi1Regs};
 use ast10x0_peripherals::create_pins;
 use ast10x0_peripherals::gpio::{bind_gpio, GpioBlock, OutputPin};
+use flash_backend::NoWaitBlocking;
+use hal_flash::{BlockingFlash, Flash, FlashAddress};
 use openprot_mctp_client_ipc::IpcMctpClient;
 use openprot_pldm_service::error::PldmMemError;
 use openprot_pldm_service::{MctpPldmTransport, PldmServiceError};
@@ -52,8 +54,13 @@ use pldm_common::protocol::firmware_update::{
 };
 use pw_status::Error;
 use userspace::{entry, syscall};
+use util_error::ErrorCode;
+use util_region::Region;
 
 use app_pldm_ua::handle;
+
+/// The SPI1 backend bound to this process's register mapping.
+type Backend = flash_backend::Ast10x0Spi1FlashDriver<Spi1Regs>;
 
 /// This board's EID, matching the MCTP server app underneath it.
 const UA_EID: u8 = 9;
@@ -62,6 +69,13 @@ const FD_EID: u8 = 8;
 
 /// Size of the demo image, in bytes. Must match the firmware device's.
 const IMAGE_SIZE: u32 = 1024;
+
+/// Where the firmware device stages the image in the shared flash. Must match
+/// the firmware device's.
+const IMAGE_BASE: u32 = 0x10_0000;
+
+/// How much of the staged image is read back at a time.
+const READBACK_CHUNK: usize = 256;
 
 /// The UUID this agent expects the firmware device to report. It only updates
 /// a device it recognises.
@@ -182,9 +196,67 @@ fn serve_fd_request(
     }
 }
 
+/// Bring up SPI1 so the staged image can be read back.
+///
+/// Read-only: nothing here erases or programs. The firmware device owns the
+/// contents; this agent only checks them.
+fn init_flash(
+    spi1_regs: Region<Spi1Regs>,
+    spi1_cs0_window: Region<Spi1Cs0Window>,
+) -> Result<BlockingFlash<Backend, NoWaitBlocking>, ErrorCode> {
+    let driver = Backend::new(spi1_regs, spi1_cs0_window)?;
+    let mut flash = BlockingFlash {
+        driver,
+        blocking: NoWaitBlocking,
+    };
+    let (capacity, sector, _) = flash.geometry()?;
+    pw_log::info!(
+        "UA: SPI1 CS0 is {} bytes, {} byte sectors",
+        capacity.get() as u32,
+        sector.get() as u32
+    );
+    // The geometry above is pinned, so this is the first call that says whether
+    // the bus actually reaches the part.
+    let jedec = flash.driver.jedec_id()?;
+    pw_log::info!(
+        "UA: SPI1 CS0 JEDEC ID {:02x} {:02x} {:02x}",
+        jedec[0] as u32,
+        jedec[1] as u32,
+        jedec[2] as u32
+    );
+    Ok(flash)
+}
+
+/// Read the image the firmware device staged and check it against what this
+/// agent handed over.
+fn staged_image_matches(flash: &mut BlockingFlash<Backend, NoWaitBlocking>) -> bool {
+    let mut buf = [0u8; READBACK_CHUNK];
+    for base in (0..IMAGE_SIZE as usize).step_by(READBACK_CHUNK) {
+        if let Err(e) = flash.read(FlashAddress::new(IMAGE_BASE + base as u32), &mut buf) {
+            pw_log::error!(
+                "UA: read at {} failed: {:08x}",
+                base as u32,
+                e.0.get() as u32
+            );
+            return false;
+        }
+        for (i, byte) in buf.iter().enumerate() {
+            if *byte != expected_byte(base + i) {
+                pw_log::error!("UA: staged byte {} is wrong", (base + i) as u32);
+                return false;
+            }
+        }
+    }
+    pw_log::info!("UA: read back {} staged bytes intact", IMAGE_SIZE as u32);
+    true
+}
+
 /// Drives the update; `Ok(true)` means the firmware device reported apply
 /// complete and then accepted activation, which is this card's pass condition.
-fn run_update(transport: &MctpPldmTransport<IpcMctpClient>) -> Result<bool, PldmServiceError> {
+fn run_update(
+    transport: &MctpPldmTransport<IpcMctpClient>,
+    flash: &mut BlockingFlash<Backend, NoWaitBlocking>,
+) -> Result<bool, PldmServiceError> {
     // Registered before UpdateComponent is sent: the firmware device starts
     // issuing RequestFirmwareData the moment it answers that command, and the
     // MCTP stack drops inbound requests with no listener bound.
@@ -350,6 +422,12 @@ fn run_update(transport: &MctpPldmTransport<IpcMctpClient>) -> Result<bool, Pldm
         return Ok(false);
     }
 
+    // Read before ActivateFirmware: once that is sent the firmware device pulses
+    // its reset line and the harness resets this board.
+    if !staged_image_matches(flash) {
+        return Ok(false);
+    }
+
     // ---- ActivateFirmware: the device runs the new image and goes Idle ----
     instance_id += 1;
     let activate = ActivateFirmwareRequest::new(
@@ -383,6 +461,15 @@ fn entry() {
     let mut alive_pin = bind_gpio(pins.scu414_29, &gpio).into_output();
     let _ = alive_pin.set_high();
 
+    let mut flash = match init_flash(mmaps.spi1_regs, mmaps.spi1_cs0_window) {
+        Ok(flash) => flash,
+        Err(e) => {
+            pw_log::error!("UA: flash init failed: {:08x}", e.0.get() as u32);
+            let _ = syscall::debug_shutdown(Err(Error::Internal));
+            loop {}
+        }
+    };
+
     let transport = MctpPldmTransport::new(IpcMctpClient::new(handle::MCTP));
 
     if transport.stack().set_eid(UA_EID).is_err() {
@@ -394,7 +481,7 @@ fn entry() {
     pw_log::info!("UA: driving an update against EID {}", FD_EID as u32);
     // The harness watches both boards and requires a verdict from each, so this
     // one reports whether it saw the update through, not just the RoT.
-    match run_update(&transport) {
+    match run_update(&transport, &mut flash) {
         Ok(true) => {
             let _ = syscall::debug_shutdown(Ok(()));
         }
