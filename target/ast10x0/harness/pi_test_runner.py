@@ -81,12 +81,12 @@ def _mirror_reset_passthrough(
     # has driven the line low once is that reset state, not a request.
     armed = False
     last = None
-    polls = 0
+    reported = None
     while not stop.wait(0.05):
         is_high = _gpio_read(pin)
-        # Roughly once a second, so a line that never moves is reported as the level it is stuck
-        # at rather than as an absence of mirror output.
-        if polls % 20 == 0:
+        # Only on change, so a line that never moves says so once instead of every second.
+        if reported != (is_high, armed):
+            reported = (is_high, armed)
             stamped = b"[%7.2f mirror] passthrough reads %s; armed=%d\n" % (
                 time.monotonic() - _T0,
                 b"high" if is_high else b"low",
@@ -98,7 +98,6 @@ def _mirror_reset_passthrough(
                     sys.stdout.buffer.flush()
             except (BrokenPipeError, OSError):
                 pass
-        polls += 1
         if not armed:
             if is_high:
                 continue

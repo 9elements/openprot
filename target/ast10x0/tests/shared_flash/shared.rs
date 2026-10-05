@@ -6,7 +6,8 @@
 
 use ast10x0_peripherals::aperture::Aperture;
 use ast10x0_peripherals::smc::{
-    FlashConfig, FlashGeometry, Pinned, SmcConfig, SmcController, SmcError, SmcInstance, SmcTopology,
+    FlashConfig, FlashGeometry, Pinned, SmcConfig, SmcController, SmcError, SmcInstance,
+    SmcTopology,
 };
 use console_backend::console_backend_write_all;
 
