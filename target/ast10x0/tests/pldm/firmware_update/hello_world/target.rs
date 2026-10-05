@@ -17,6 +17,8 @@ impl TargetInterface for Target {
         // Distinct from entry.rs's own greeting so the harness can tell the
         // delivered image apart from whatever was booted before it.
         let _ = console_backend_write_all(b"HELLO_FROM_UPDATED_IMAGE\r\n");
+        // The payload is the thing being proven, so it reports its own verdict.
+        let _ = console_backend_write_all(b"TEST_RESULT:PASS\r\n");
         #[expect(clippy::empty_loop)]
         loop {}
     }

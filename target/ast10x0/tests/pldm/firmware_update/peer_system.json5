@@ -128,6 +128,20 @@
                             start_address: 0x90000000,
                             size_bytes: 0x04000000,
                         },
+                        // This board's own boot flash, on FMC CS0. FMC pinctrl is
+                        // applied by the kernel target's pre-task init.
+                        {
+                            name: "fmc_regs",
+                            type: "device",
+                            start_address: 0x7e620000,
+                            size_bytes: 0x1000,
+                        },
+                        {
+                            name: "fmc_cs0_window",
+                            type: "device",
+                            start_address: 0x80000000,
+                            size_bytes: 0x800000,
+                        },
                     ],
                 },
             ],

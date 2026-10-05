@@ -18,7 +18,7 @@
 
 use core::cell::Cell;
 
-use app_pldm_ua_regions::{take_mmaps, Spi1Cs0Window, Spi1Regs};
+use app_pldm_ua_regions::{take_mmaps, FmcCs0Window, FmcRegs, Spi1Cs0Window, Spi1Regs};
 use ast10x0_peripherals::create_pins;
 use ast10x0_peripherals::gpio::{bind_gpio, GpioBlock, OutputPin};
 use flash_backend::NoWaitBlocking;
@@ -63,6 +63,9 @@ use app_pldm_ua::handle;
 /// The SPI1 backend bound to this process's register mapping.
 type Backend = flash_backend::Ast10x0Spi1FlashDriver<Spi1Regs>;
 
+/// The FMC backend for this board's own boot flash.
+type BootBackend = flash_backend::Ast10x0FmcCs0FlashDriver<FmcRegs>;
+
 /// This board's EID, matching the MCTP server app underneath it.
 const UA_EID: u8 = 9;
 /// The firmware device's EID on the RoT.
@@ -78,6 +81,10 @@ const IMAGE_BASE: u32 = 0x10_0000;
 
 /// How much of the staged image is read back at a time.
 const READBACK_CHUNK: usize = 256;
+
+/// Where the boot ROM looks for the Aspeed secure-boot header. Only the image
+/// size at `header[8..12]` matters on an unfused part.
+const SB_HEADER_OFFSET: usize = 0x400;
 
 /// The UUID this agent expects the firmware device to report. It only updates
 /// a device it recognises.
@@ -250,11 +257,127 @@ fn staged_image_matches(flash: &mut BlockingFlash<Backend, NoWaitBlocking>) -> b
     true
 }
 
+/// Bring up the FMC so this board's own boot flash can be rewritten.
+fn init_boot_flash(
+    fmc_regs: Region<FmcRegs>,
+    fmc_cs0_window: Region<FmcCs0Window>,
+) -> Result<BlockingFlash<BootBackend, NoWaitBlocking>, ErrorCode> {
+    let driver = BootBackend::new(fmc_regs, fmc_cs0_window)?;
+    let mut flash = BlockingFlash {
+        driver,
+        blocking: NoWaitBlocking,
+    };
+    let (capacity, sector, _) = flash.geometry()?;
+    pw_log::info!(
+        "UA: FMC CS0 is {} bytes, {} byte sectors",
+        capacity.get() as u32,
+        sector.get() as u32
+    );
+    let jedec = flash.driver.jedec_id()?;
+    pw_log::info!(
+        "UA: FMC CS0 JEDEC ID {:02x} {:02x} {:02x}",
+        jedec[0] as u32,
+        jedec[1] as u32,
+        jedec[2] as u32
+    );
+    Ok(flash)
+}
+
+/// Build the header the boot ROM reads at `SB_HEADER_OFFSET`.
+fn sb_header(img_size: usize) -> [u8; 32] {
+    let mut header = [0u8; 32];
+    header[8..12].copy_from_slice(&(img_size as u32).to_le_bytes());
+    header
+}
+
+/// Overlay `header` onto `out` wherever this chunk straddles `SB_HEADER_OFFSET`.
+fn overlay_header(offset: usize, header: &[u8; 32], out: &mut [u8]) {
+    let start = SB_HEADER_OFFSET.max(offset);
+    let end = (SB_HEADER_OFFSET + header.len()).min(offset + out.len());
+    if start < end {
+        out[start - offset..end - offset]
+            .copy_from_slice(&header[start - SB_HEADER_OFFSET..end - SB_HEADER_OFFSET]);
+    }
+}
+
+/// Copy the staged image out of the shared flash into this board's boot flash,
+/// so the next reset runs what the firmware device just delivered.
+///
+/// Safe to erase while running: the part is non-XIP and this image was uploaded
+/// over UART into SRAM, so nothing is being fetched from the flash below.
+fn copy_staged_to_boot_flash(
+    staging: &mut BlockingFlash<Backend, NoWaitBlocking>,
+    boot: &mut BlockingFlash<BootBackend, NoWaitBlocking>,
+) -> bool {
+    let sector = match boot.geometry() {
+        Ok((_, sector, _)) => sector,
+        Err(e) => {
+            pw_log::error!("UA: boot flash geometry failed: {:08x}", e.0.get() as u32);
+            return false;
+        }
+    };
+
+    let erase_len = (IMAGE.len()).next_multiple_of(sector.get());
+    for base in (0..erase_len).step_by(sector.get()) {
+        if let Err(e) = boot.erase(FlashAddress::new(base as u32), sector) {
+            pw_log::error!(
+                "UA: boot flash erase at {} failed: {:08x}",
+                base as u32,
+                e.0.get() as u32
+            );
+            return false;
+        }
+    }
+    pw_log::info!("UA: erased {} bytes of boot flash", erase_len as u32);
+
+    let header = sb_header(IMAGE.len());
+    let mut buf = [0u8; READBACK_CHUNK];
+    let mut check = [0u8; READBACK_CHUNK];
+    for base in (0..IMAGE.len()).step_by(READBACK_CHUNK) {
+        let n = (IMAGE.len() - base).min(READBACK_CHUNK);
+        let buf = &mut buf[..n];
+        if let Err(e) = staging.read(FlashAddress::new(IMAGE_BASE + base as u32), buf) {
+            pw_log::error!(
+                "UA: staged read at {} failed: {:08x}",
+                base as u32,
+                e.0.get() as u32
+            );
+            return false;
+        }
+        overlay_header(base, &header, buf);
+        if let Err(e) = boot.program(FlashAddress::new(base as u32), buf) {
+            pw_log::error!(
+                "UA: boot flash program at {} failed: {:08x}",
+                base as u32,
+                e.0.get() as u32
+            );
+            return false;
+        }
+        let check = &mut check[..n];
+        if let Err(e) = boot.read(FlashAddress::new(base as u32), check) {
+            pw_log::error!(
+                "UA: boot flash read at {} failed: {:08x}",
+                base as u32,
+                e.0.get() as u32
+            );
+            return false;
+        }
+        if check != buf {
+            pw_log::error!("UA: boot flash differs at {}", base as u32);
+            return false;
+        }
+    }
+
+    pw_log::info!("UA: wrote {} bytes to boot flash", IMAGE_SIZE as u32);
+    true
+}
+
 /// Drives the update; `Ok(true)` means the firmware device reported apply
 /// complete and then accepted activation, which is this card's pass condition.
 fn run_update(
     transport: &MctpPldmTransport<IpcMctpClient>,
     flash: &mut BlockingFlash<Backend, NoWaitBlocking>,
+    boot: &mut BlockingFlash<BootBackend, NoWaitBlocking>,
 ) -> Result<bool, PldmServiceError> {
     // Registered before UpdateComponent is sent: the firmware device starts
     // issuing RequestFirmwareData the moment it answers that command, and the
@@ -421,9 +544,12 @@ fn run_update(
         return Ok(false);
     }
 
-    // Read before ActivateFirmware: once that is sent the firmware device pulses
-    // its reset line and the harness resets this board.
+    // Read and copy before ActivateFirmware: once that is sent the firmware
+    // device pulses its reset line and the harness resets this board.
     if !staged_image_matches(flash) {
+        return Ok(false);
+    }
+    if !copy_staged_to_boot_flash(flash, boot) {
         return Ok(false);
     }
 
@@ -469,6 +595,15 @@ fn entry() {
         }
     };
 
+    let mut boot = match init_boot_flash(mmaps.fmc_regs, mmaps.fmc_cs0_window) {
+        Ok(flash) => flash,
+        Err(e) => {
+            pw_log::error!("UA: boot flash init failed: {:08x}", e.0.get() as u32);
+            let _ = syscall::debug_shutdown(Err(Error::Internal));
+            loop {}
+        }
+    };
+
     let transport = MctpPldmTransport::new(IpcMctpClient::new(handle::MCTP));
 
     if transport.stack().set_eid(UA_EID).is_err() {
@@ -478,11 +613,11 @@ fn entry() {
     }
 
     pw_log::info!("UA: driving an update against EID {}", FD_EID as u32);
-    // The harness watches both boards and requires a verdict from each, so this
-    // one reports whether it saw the update through, not just the RoT.
-    match run_update(&transport, &mut flash) {
+    // Only failures report a verdict here. On success this board's verdict comes
+    // from the delivered image once the reset boots it out of flash.
+    match run_update(&transport, &mut flash, &mut boot) {
         Ok(true) => {
-            let _ = syscall::debug_shutdown(Ok(()));
+            pw_log::info!("UA: update staged and copied, waiting for the reset");
         }
         Ok(false) => {
             let _ = syscall::debug_shutdown(Err(Error::Internal));

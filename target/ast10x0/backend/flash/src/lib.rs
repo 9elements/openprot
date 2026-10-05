@@ -6,7 +6,8 @@
 //! Adapts the SMC SPI-NOR peripheral driver to `hal_flash_driver::FlashDriver`
 //! so it can be wrapped by `hal_flash::BlockingFlash` and served over IPC by
 //! `services_flash_server::FlashIpcServer`. Each consumer names the controller
-//! it drives: `Ast10x0FmcFlashDriver` for the boot flash on FMC CS1,
+//! it drives: `Ast10x0FmcFlashDriver` for the flash on FMC CS1,
+//! `Ast10x0FmcCs0FlashDriver` for the boot flash on FMC CS0, and
 //! `Ast10x0Spi1FlashDriver` for the shared staging flash on SPI1 CS0.
 
 #![no_std]
@@ -162,6 +163,143 @@ impl<R: Mmap> FlashDriver for Ast10x0Spi1FlashDriver<R> {
         // Only sector erase is implemented by the peripheral driver.
         Ok(1u32
             << Cs0Geometry::<R>::geometry(&self.geometry)
+                .sector_size
+                .trailing_zeros())
+    }
+
+    fn read(&mut self, start_addr: FlashAddress, buf: &mut [u8]) -> Result<(), Self::Error> {
+        let len = buf.len();
+        let n = self
+            .device()?
+            .read(start_addr.offset(), buf)
+            .map_err(map_smc_error)?;
+        if n != len {
+            return Err(error::FLASH_AST10X0_SHORT_READ);
+        }
+        Ok(())
+    }
+
+    fn start_erase(
+        &mut self,
+        start_addr: FlashAddress,
+        size: PowerOf2Usize,
+    ) -> Result<(), Self::Error> {
+        if size.get() != self.geometry.sector_size as usize {
+            return Err(error::FLASH_GENERIC_ERASE_INVALID_SIZE);
+        }
+        // Blocks until the device's WIP bit clears; see `NoWaitBlocking`.
+        self.device()?
+            .erase_sector(start_addr.offset())
+            .map_err(map_smc_error)
+    }
+
+    fn start_program(&mut self, start_addr: FlashAddress, data: &[u8]) -> Result<(), Self::Error> {
+        // Blocks until the device's WIP bit clears; see `NoWaitBlocking`.
+        self.device()?
+            .program_page(start_addr.offset(), data)
+            .map_err(map_smc_error)?;
+        Ok(())
+    }
+
+    fn is_busy(&mut self) -> bool {
+        false
+    }
+
+    fn complete_op(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Compile-time descriptor for the FMC driving the boot flash on CS0.
+///
+/// CS1 is left off so CS0 decodes from the aperture base rather than the
+/// aperture being split in half.
+struct FmcCs0Instance<R: Mmap>(PhantomData<R>);
+
+impl<R: Mmap> SmcInstance for FmcCs0Instance<R> {
+    type Regs = R;
+
+    const CONTROLLER: SmcController = SmcController::Fmc;
+    const CONFIG: SmcConfig = SmcConfig {
+        cs0: Some(FlashConfig { spi_clock_mhz: 50 }),
+        cs1: None,
+        dma_enabled: false,
+        enable_interrupts: false,
+        topology: SmcTopology::BootSpi { master_idx: 0 },
+    };
+}
+
+/// Geometry source for the boot chip (CS0). `Pinned` here makes the reported
+/// geometry a compile-time constant; `Discover` reports the SFDP-read value.
+type FmcCs0Geometry<R> = <FmcCs0Instance<R> as SmcInstance>::Cs0Geometry;
+
+/// FMC CS0 boot flash driver.
+pub struct Ast10x0FmcCs0FlashDriver<R: Mmap> {
+    fmc: FmcReady<FmcCs0Instance<R>>,
+    geometry: FlashGeometry,
+}
+
+impl<R: Mmap> Ast10x0FmcCs0FlashDriver<R> {
+    /// Initialize the FMC from the regions mapped to this process.
+    ///
+    /// The FMC pinmux (`PINCTRL_FMC_QUAD`) must already have been applied by the
+    /// kernel target's pre-task init; this driver never touches the shared SCU.
+    pub fn new<Cs0>(regs: Region<R>, cs0_window: Region<Cs0>) -> Result<Self, ErrorCode>
+    where
+        Cs0: Mmap,
+    {
+        let uninit =
+            FmcUninit::<FmcCs0Instance<R>>::new(regs, cs0_window, Region::<Unmapped>::unmapped())
+                .map_err(map_smc_error)?;
+        let mut fmc = uninit.init().map_err(map_smc_error)?;
+        let geometry = {
+            let cs0 = fmc.cs0().map_err(map_smc_error)?;
+            cs0.geometry()
+        };
+        NonZero::new(geometry.capacity_bytes as usize)
+            .ok_or(error::FLASH_AST10X0_INVALID_CAPACITY)?;
+        Ok(Self { fmc, geometry })
+    }
+
+    /// Read the device's JEDEC ID: all-zero means chip select never asserted,
+    /// all-ones means the line is floating.
+    pub fn jedec_id(&mut self) -> Result<[u8; 3], ErrorCode> {
+        self.device()?.jedec_id().map_err(map_smc_error)
+    }
+
+    fn device(&mut self) -> Result<SpiNorFlash<'_>, ErrorCode> {
+        let cs = self.fmc.cs0().map_err(map_smc_error)?;
+        SpiNorFlash::new(cs).map_err(map_smc_error)
+    }
+}
+
+impl<R: Mmap> FlashDriver for Ast10x0FmcCs0FlashDriver<R> {
+    type Error = ErrorCode;
+
+    // PAGE_SIZE / PROGRAM_WINDOW_SIZE are defaulted to 0, geometry is discovered instead
+    const MAX_READ_SIZE: usize = 4096;
+    const READ_ALIGNMENT: usize = 4;
+    const PROGRAM_ALIGNMENT: usize = 1;
+
+    fn size(&self) -> NonZero<usize> {
+        NonZero::new(FmcCs0Geometry::<R>::geometry(&self.geometry).capacity_bytes as usize)
+            .expect("capacity validated in new()")
+    }
+
+    /// Default erase page: one SFDP-discovered sector.
+    fn page_size(&self) -> usize {
+        FmcCs0Geometry::<R>::geometry(&self.geometry).sector_size as usize
+    }
+
+    /// SPI NOR program page: writes must not cross this boundary.
+    fn program_window_size(&self) -> usize {
+        FmcCs0Geometry::<R>::geometry(&self.geometry).page_size as usize
+    }
+
+    fn erasable_sizes_bitmap(&mut self) -> Result<u32, Self::Error> {
+        // Only sector erase is implemented by the peripheral driver.
+        Ok(1u32
+            << FmcCs0Geometry::<R>::geometry(&self.geometry)
                 .sector_size
                 .trailing_zeros())
     }
