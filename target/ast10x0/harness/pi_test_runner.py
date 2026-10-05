@@ -289,6 +289,16 @@ def _run_paired(args, firmware_path: Path, slave_firmware_path: Path) -> bool:
             return False
         _upload_firmware(port_b, slave_firmware_path)
 
+        # The uploaded image only stages the real one into boot flash, so take
+        # its "staged" verdict and restart it before anything else can touch
+        # srst; what boots next is the firmware the rest of the run depends on.
+        if args.slave_stages_to_flash:
+            if not _stream_uart(port_b, _stdout_lock, "B"):
+                return False
+            _sequence_to_normal_mode(
+                args.slave_srst_pin, args.slave_fwspick_pin, port_b
+            )
+
         # Started only now: the mirror drives the same srst line that the mock
         # BMC's own flash sequence above toggles, so the two would fight.
         if args.reset_passthrough_pin is not None:
@@ -385,6 +395,12 @@ def main() -> int:
         type=int,
         default=None,
         help="BCM GPIO pin connected to device B FWSPICK",
+    )
+    parser.add_argument(
+        "--slave-stages-to-flash",
+        action="store_true",
+        help="Device B's uploaded image only stages the real one into boot "
+        "flash; restart it once it reports and run from what boots",
     )
     parser.add_argument(
         "--reset-passthrough-pin",

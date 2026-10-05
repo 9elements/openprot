@@ -89,9 +89,9 @@ const READBACK_CHUNK: usize = 256;
 
 /// How long the FD waits for an update agent command before giving up and
 /// reporting the result. This board is flashed first, so it must outlast the
-/// mock BMC's UART upload (~50s for a 512 KiB image at 115200 baud) plus its
-/// boot.
-const IDLE_TIMEOUT_MILLIS: u32 = 90_000;
+/// mock BMC's UART upload (~50s for a 512 KiB image at 115200 baud), the
+/// staging of that image into its boot flash, and the reset that boots it.
+const IDLE_TIMEOUT_MILLIS: u32 = 180_000;
 /// How long each FD-initiated request waits for the update agent's reply.
 const REQUESTER_TIMEOUT_MILLIS: u32 = 5_000;
 
@@ -257,6 +257,7 @@ fn checksum(mut acc: u32, data: &[u8]) -> u32 {
 struct DemoFdOps {
     flash: RefCell<BlockingFlash<Backend, NoWaitBlocking>>,
     sector: PowerOf2Usize,
+    capacity: usize,
     erased_through: Cell<usize>,
     bytes_received: Cell<usize>,
     checksum: Cell<u32>,
@@ -266,10 +267,15 @@ struct DemoFdOps {
 }
 
 impl DemoFdOps {
-    fn new(flash: BlockingFlash<Backend, NoWaitBlocking>, sector: PowerOf2Usize) -> Self {
+    fn new(
+        flash: BlockingFlash<Backend, NoWaitBlocking>,
+        sector: PowerOf2Usize,
+        capacity: usize,
+    ) -> Self {
         DemoFdOps {
             flash: RefCell::new(flash),
             sector,
+            capacity,
             erased_through: Cell::new(0),
             bytes_received: Cell::new(0),
             checksum: Cell::new(CHECKSUM_INIT),
@@ -348,6 +354,18 @@ impl FdOps for DemoFdOps {
         let code = component.evaluate_update_eligibility(fw_params);
         if code != ComponentResponseCode::CompCanBeUpdated {
             pw_log::error!("FD: component refused, code {}", code as u32);
+            return Ok(code);
+        }
+        // The staging region starts partway up the part, so an image that fits
+        // the flash can still run off the end of what is left above IMAGE_BASE.
+        let size = image_size(component);
+        if size > self.capacity.saturating_sub(IMAGE_BASE as usize) {
+            pw_log::error!(
+                "FD: {} byte image does not fit the {} bytes above the staging base",
+                size as u32,
+                (self.capacity.saturating_sub(IMAGE_BASE as usize)) as u32
+            );
+            return Ok(ComponentResponseCode::CompNotSupported);
         }
         Ok(code)
     }
@@ -510,7 +528,7 @@ impl FdOps for DemoFdOps {
 fn init_flash(
     spi1_regs: Region<Spi1Regs>,
     spi1_cs0_window: Region<Spi1Cs0Window>,
-) -> Result<(BlockingFlash<Backend, NoWaitBlocking>, PowerOf2Usize), ErrorCode> {
+) -> Result<(BlockingFlash<Backend, NoWaitBlocking>, PowerOf2Usize, usize), ErrorCode> {
     // The kernel target applied the SPI1 pinmux and the SPIM0 route to the BMC
     // flash before any process started.
     let driver = Backend::new(spi1_regs, spi1_cs0_window)?;
@@ -524,14 +542,14 @@ fn init_flash(
         capacity.get() as u32,
         sector.get() as u32
     );
-    Ok((flash, sector))
+    Ok((flash, sector, capacity.get()))
 }
 
 #[entry]
 fn entry() {
     // SAFETY: mints this process's memory mappings once, at its entry point.
     let mmaps = unsafe { take_mmaps() };
-    let (flash, sector) = match init_flash(mmaps.spi1_regs, mmaps.spi1_cs0_window) {
+    let (flash, sector, capacity) = match init_flash(mmaps.spi1_regs, mmaps.spi1_cs0_window) {
         Ok(flash) => flash,
         Err(e) => {
             pw_log::error!("FD: flash init failed: {:08x}", e.0.get() as u32);
@@ -539,7 +557,7 @@ fn entry() {
             loop {}
         }
     };
-    let fd_ops = DemoFdOps::new(flash, sector);
+    let fd_ops = DemoFdOps::new(flash, sector, capacity);
 
     // SAFETY: sole pin creation site in this binary; the pins! table is this chip's true pin map.
     let pins = unsafe { create_pins() };

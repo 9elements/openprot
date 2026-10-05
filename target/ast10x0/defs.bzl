@@ -62,16 +62,32 @@ def _system_image_test_impl(ctx):
             runfiles.merge(ctx.attr.slave_image[DefaultInfo].default_runfiles),
         )
 
+    # Images whose code runs on a board but which are never uploaded by the
+    # harness, so their format strings would otherwise be missing from the
+    # detokenizer and print as $base64.
+    for i, img in enumerate(getattr(ctx.attr, "token_images", [])):
+        token_elf_symlink = ctx.actions.declare_file(
+            "%s.tokens%d.elf" % (ctx.label.name, i),
+        )
+        ctx.actions.symlink(
+            output = token_elf_symlink,
+            target_file = img[SystemImageInfo].elf,
+        )
+        runfiles = ctx.runfiles(files = [token_elf_symlink]).merge(runfiles)
+
     providers = [DefaultInfo(
         executable = executable_symlink,
         runfiles = runfiles,
     )]
 
     # Absent on flash_system_image_test, which shares this implementation.
+    env = {}
     if getattr(ctx.attr, "reboot_from_flash", False):
-        providers.append(RunEnvironmentInfo(
-            environment = {"AST10X0_REBOOT_FROM_FLASH": "1"},
-        ))
+        env["AST10X0_REBOOT_FROM_FLASH"] = "1"
+    if getattr(ctx.attr, "slave_stages_to_flash", False):
+        env["AST10X0_SLAVE_STAGES_TO_FLASH"] = "1"
+    if env:
+        providers.append(RunEnvironmentInfo(environment = env))
     return providers
 
 def _flash_system_image_test_impl(ctx):
@@ -116,6 +132,19 @@ system_image_test = rule(
             doc = "Optional slave system_image for paired two-device tests.",
             mandatory = False,
             default = None,
+            providers = [SystemImageInfo],
+            cfg = "target",
+        ),
+        "slave_stages_to_flash": attr.bool(
+            doc = "The slave image only stages a payload into its own boot " +
+                  "flash, so restart it with FWSPICK low once it reports and " +
+                  "take the real verdict from what boots.",
+            default = False,
+        ),
+        "token_images": attr.label_list(
+            doc = "Extra system_images whose logs appear on a UART but which " +
+                  "the harness never uploads, such as a payload carried by " +
+                  "the slave image. Only their tokens are used.",
             providers = [SystemImageInfo],
             cfg = "target",
         ),

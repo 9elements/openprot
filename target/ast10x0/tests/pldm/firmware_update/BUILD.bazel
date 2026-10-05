@@ -250,7 +250,6 @@ rust_app(
         "//services/pldm:pldm_service",
         "//target/ast10x0/backend/flash:flash_backend_ast10x0",
         "//target/ast10x0/peripherals",
-        "//target/ast10x0/tests/pldm/firmware_update/hello_world:hello_world_image_blob",
         "//util/error",
         "//util/region",
         "@ast1060_pac",
@@ -293,12 +292,14 @@ system_image(
 
 # `image` goes to device A, the only board whose reset-passthrough pin the Pi
 # watches, so the firmware device has to be that one. Device A is also flashed
-# first, so it is listening before the update agent boots and sends RequestUpdate.
+# first, so it is listening before the update agent boots and sends
+# RequestUpdate -- and now also waits out device B's staging and restart.
 system_image_test(
     name = "pldm_firmware_update_test",
     timeout = "eternal",
     image = ":pldm_fd_image",
-    slave_image = ":pldm_ua_image",
+    slave_image = "//target/ast10x0/tests/pldm/firmware_update/bootstrap:bootstrap_image",
+    slave_stages_to_flash = True,
     tags = [
         "hardware",
         "manual",
@@ -307,4 +308,5 @@ system_image_test(
         "//target/ast10x0:qemu_enabled": ["@platforms//:incompatible"],
         "//conditions:default": [],
     }),
+    token_images = [":pldm_ua_image"],
 )

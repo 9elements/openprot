@@ -23,7 +23,6 @@ use ast10x0_peripherals::create_pins;
 use ast10x0_peripherals::gpio::{bind_gpio, GpioBlock, OutputPin};
 use flash_backend::NoWaitBlocking;
 use hal_flash::{BlockingFlash, Flash, FlashAddress};
-use hello_world_image_blob::IMAGE;
 use openprot_mctp_client_ipc::IpcMctpClient;
 use openprot_pldm_service::error::PldmMemError;
 use openprot_pldm_service::{MctpPldmTransport, PldmServiceError};
@@ -71,10 +70,6 @@ const UA_EID: u8 = 9;
 /// The firmware device's EID on the RoT.
 const FD_EID: u8 = 8;
 
-/// Size of the image handed over, in bytes. The firmware device learns it from
-/// UpdateComponent rather than being told separately.
-const IMAGE_SIZE: u32 = IMAGE.len() as u32;
-
 /// Where the firmware device stages the image in the shared flash. Must match
 /// the firmware device's.
 const IMAGE_BASE: u32 = 0x10_0000;
@@ -85,6 +80,21 @@ const READBACK_CHUNK: usize = 256;
 /// Where the boot ROM looks for the Aspeed secure-boot header. Only the image
 /// size at `header[8..12]` matters on an unfused part.
 const SB_HEADER_OFFSET: usize = 0x400;
+
+/// Which generation of this image is running. In `.rodata`, so `&raw const` is
+/// its offset in the image on this non-XIP part; a `.data` static would resolve
+/// to the RAM copy instead. The bump applied on the way out over PLDM is what
+/// the second boot prints, so it can only have come from the round trip.
+#[used]
+pub static BOOT_VERSION: u32 = 0;
+
+/// Read the version out of the running image. Volatile because these bytes are
+/// patched after compilation, so the initializer above is not the truth and the
+/// compiler must not fold reads of it back to zero.
+fn boot_version() -> u32 {
+    // SAFETY: reads a live static in this image.
+    unsafe { core::ptr::read_volatile(&raw const BOOT_VERSION) }
+}
 
 /// The UUID this agent expects the firmware device to report. It only updates
 /// a device it recognises.
@@ -102,9 +112,11 @@ const REQUEST_TIMEOUT_MILLIS: u32 = 5_000;
 const SERVE_TIMEOUT_MILLIS: u32 = 30_000;
 
 /// Upper bound on firmware-device-initiated requests served before giving up.
-/// A clean run is ceil(IMAGE_SIZE / MAX_TRANSFER_SIZE) RequestFirmwareData plus
+/// A clean run is ceil(image_size / MAX_TRANSFER_SIZE) RequestFirmwareData plus
 /// TransferComplete, VerifyComplete, and ApplyComplete.
-const MAX_SERVED_REQUESTS: u32 = IMAGE_SIZE.div_ceil(MAX_TRANSFER_SIZE as u32) + 3;
+fn max_served_requests(image_size: u32) -> u32 {
+    image_size.div_ceil(MAX_TRANSFER_SIZE as u32) + 3
+}
 
 const UA_BUF_SIZE: usize = 1024;
 
@@ -127,10 +139,16 @@ fn fw_string(s: &str) -> PldmFirmwareString {
 /// `framed_buf[1..req_total_len]`; the response is written back over
 /// `framed_buf[1..]`. Returns the total response length including the type
 /// byte, and sets `saw_apply_complete` once the device reports it is done.
+///
+/// The bytes handed over are this board's own firmware, read back out of the
+/// boot flash the ROM loaded it from. Reading SRAM instead would need a mapping
+/// of the whole image, which the MPU cannot express without covering the kernel.
 fn serve_fd_request(
     framed_buf: &mut [u8],
     req_total_len: usize,
     saw_apply_complete: &Cell<bool>,
+    boot: &mut BlockingFlash<BootBackend, NoWaitBlocking>,
+    image_size: u32,
 ) -> Result<usize, PldmServiceError> {
     let success = PldmBaseCompletionCode::Success as u8;
 
@@ -167,13 +185,24 @@ fn serve_fd_request(
                 pw_log::error!("UA: FD asked for {} bytes, over the MTU", length as u32);
                 return Ok(0);
             }
-            let chunk = offset
+            if offset
                 .checked_add(length)
-                .and_then(|end| IMAGE.get(offset..end));
-            let Some(chunk) = chunk else {
+                .is_none_or(|end| end > image_size as usize)
+            {
                 pw_log::error!("UA: FD asked for bytes past the end of the image");
                 return Ok(0);
-            };
+            }
+            let mut chunk_buf = [0u8; MAX_TRANSFER_SIZE];
+            let chunk = &mut chunk_buf[..length];
+            if let Err(e) = boot.read(FlashAddress::new(offset as u32), chunk) {
+                pw_log::error!(
+                    "UA: boot read at {} failed: {:08x}",
+                    offset as u32,
+                    e.0.get() as u32
+                );
+                return Ok(0);
+            }
+            overlay_version(offset, chunk);
             let msg = RequestFirmwareDataResponse::new(instance_id, success, chunk);
             PldmCodecWithLifetime::encode(&msg, resp)
         }
@@ -235,11 +264,20 @@ fn init_flash(
 
 /// Read the image the firmware device staged and check it against what this
 /// agent handed over.
-fn staged_image_matches(flash: &mut BlockingFlash<Backend, NoWaitBlocking>) -> bool {
+///
+/// Runs before the boot flash is erased, so it is still the same source the
+/// chunks were served from.
+fn staged_image_matches(
+    flash: &mut BlockingFlash<Backend, NoWaitBlocking>,
+    boot: &mut BlockingFlash<BootBackend, NoWaitBlocking>,
+    image_size: u32,
+) -> bool {
     let mut buf = [0u8; READBACK_CHUNK];
-    for base in (0..IMAGE.len()).step_by(READBACK_CHUNK) {
-        let n = (IMAGE.len() - base).min(READBACK_CHUNK);
+    let mut src = [0u8; READBACK_CHUNK];
+    for base in (0..image_size as usize).step_by(READBACK_CHUNK) {
+        let n = (image_size as usize - base).min(READBACK_CHUNK);
         let buf = &mut buf[..n];
+        let src = &mut src[..n];
         if let Err(e) = flash.read(FlashAddress::new(IMAGE_BASE + base as u32), buf) {
             pw_log::error!(
                 "UA: read at {} failed: {:08x}",
@@ -248,12 +286,21 @@ fn staged_image_matches(flash: &mut BlockingFlash<Backend, NoWaitBlocking>) -> b
             );
             return false;
         }
-        if buf != &IMAGE[base..base + n] {
+        if let Err(e) = boot.read(FlashAddress::new(base as u32), src) {
+            pw_log::error!(
+                "UA: boot read at {} failed: {:08x}",
+                base as u32,
+                e.0.get() as u32
+            );
+            return false;
+        }
+        overlay_version(base, src);
+        if buf != src {
             pw_log::error!("UA: staged bytes differ at {}", base as u32);
             return false;
         }
     }
-    pw_log::info!("UA: read back {} staged bytes intact", IMAGE_SIZE as u32);
+    pw_log::info!("UA: read back {} staged bytes intact", image_size as u32);
     true
 }
 
@@ -300,6 +347,19 @@ fn overlay_header(offset: usize, header: &[u8; 32], out: &mut [u8]) {
     }
 }
 
+/// Overlay the incremented version onto `out` wherever this chunk straddles the
+/// `BOOT_VERSION` field. Applied only to bytes on their way out over PLDM, so
+/// the higher number can reach this board's flash by the round trip alone.
+fn overlay_version(offset: usize, out: &mut [u8]) {
+    let bytes = (boot_version() + 1).to_le_bytes();
+    let field = &raw const BOOT_VERSION as usize;
+    let start = field.max(offset);
+    let end = (field + bytes.len()).min(offset + out.len());
+    if start < end {
+        out[start - offset..end - offset].copy_from_slice(&bytes[start - field..end - field]);
+    }
+}
+
 /// Copy the staged image out of the shared flash into this board's boot flash,
 /// so the next reset runs what the firmware device just delivered.
 ///
@@ -308,6 +368,7 @@ fn overlay_header(offset: usize, header: &[u8; 32], out: &mut [u8]) {
 fn copy_staged_to_boot_flash(
     staging: &mut BlockingFlash<Backend, NoWaitBlocking>,
     boot: &mut BlockingFlash<BootBackend, NoWaitBlocking>,
+    image_size: u32,
 ) -> bool {
     let sector = match boot.geometry() {
         Ok((_, sector, _)) => sector,
@@ -317,7 +378,7 @@ fn copy_staged_to_boot_flash(
         }
     };
 
-    let erase_len = (IMAGE.len()).next_multiple_of(sector.get());
+    let erase_len = (image_size as usize).next_multiple_of(sector.get());
     for base in (0..erase_len).step_by(sector.get()) {
         if let Err(e) = boot.erase(FlashAddress::new(base as u32), sector) {
             pw_log::error!(
@@ -330,11 +391,11 @@ fn copy_staged_to_boot_flash(
     }
     pw_log::info!("UA: erased {} bytes of boot flash", erase_len as u32);
 
-    let header = sb_header(IMAGE.len());
+    let header = sb_header(image_size as usize);
     let mut buf = [0u8; READBACK_CHUNK];
     let mut check = [0u8; READBACK_CHUNK];
-    for base in (0..IMAGE.len()).step_by(READBACK_CHUNK) {
-        let n = (IMAGE.len() - base).min(READBACK_CHUNK);
+    for base in (0..image_size as usize).step_by(READBACK_CHUNK) {
+        let n = (image_size as usize - base).min(READBACK_CHUNK);
         let buf = &mut buf[..n];
         if let Err(e) = staging.read(FlashAddress::new(IMAGE_BASE + base as u32), buf) {
             pw_log::error!(
@@ -368,8 +429,17 @@ fn copy_staged_to_boot_flash(
         }
     }
 
-    pw_log::info!("UA: wrote {} bytes to boot flash", IMAGE_SIZE as u32);
+    pw_log::info!("UA: wrote {} bytes to boot flash", image_size as u32);
     true
+}
+
+/// Read the image length the boot ROM uses out of this board's own boot flash.
+fn boot_image_size(
+    boot: &mut BlockingFlash<BootBackend, NoWaitBlocking>,
+) -> Result<u32, ErrorCode> {
+    let mut len = [0u8; 4];
+    boot.read(FlashAddress::new((SB_HEADER_OFFSET + 8) as u32), &mut len)?;
+    Ok(u32::from_le_bytes(len))
 }
 
 /// Drives the update; `Ok(true)` means the firmware device reported apply
@@ -378,6 +448,7 @@ fn run_update(
     transport: &MctpPldmTransport<IpcMctpClient>,
     flash: &mut BlockingFlash<Backend, NoWaitBlocking>,
     boot: &mut BlockingFlash<BootBackend, NoWaitBlocking>,
+    image_size: u32,
 ) -> Result<bool, PldmServiceError> {
     // Registered before UpdateComponent is sent: the firmware device starts
     // issuing RequestFirmwareData the moment it answers that command, and the
@@ -464,7 +535,7 @@ fn run_update(
     let req_update = RequestUpdateRequest::new(
         instance_id,
         PldmMsgType::Request,
-        IMAGE_SIZE, // max_transfer_size
+        image_size, // max_transfer_size
         1,          // num_of_comp
         1,          // max_outstanding_transfer_req
         0,          // pkg_data_len
@@ -509,7 +580,7 @@ fn run_update(
         comp_identifier,
         comp_classification_index,
         COMP_COMPARISON_STAMP,
-        IMAGE_SIZE,
+        image_size,
         UpdateOptionFlags(0),
         &comp_ver,
     );
@@ -522,15 +593,22 @@ fn run_update(
         return Ok(false);
     }
 
-    pw_log::info!("UA: handing over {} bytes", IMAGE_SIZE as u32);
+    pw_log::info!("UA: handing over {} bytes", image_size as u32);
 
+    let max_requests = max_served_requests(image_size);
     let saw_apply_complete = Cell::new(false);
-    for _ in 0..MAX_SERVED_REQUESTS {
+    for _ in 0..max_requests {
         transport.respond_once(
             &mut listener,
             &mut buf,
             |framed_buf, req_total_len, _eid| {
-                serve_fd_request(framed_buf, req_total_len, &saw_apply_complete)
+                serve_fd_request(
+                    framed_buf,
+                    req_total_len,
+                    &saw_apply_complete,
+                    boot,
+                    image_size,
+                )
             },
         )?;
         if saw_apply_complete.get() {
@@ -540,16 +618,16 @@ fn run_update(
     }
 
     if !saw_apply_complete.get() {
-        pw_log::error!("UA: gave up after {} requests", MAX_SERVED_REQUESTS as u32);
+        pw_log::error!("UA: gave up after {} requests", max_requests as u32);
         return Ok(false);
     }
 
     // Read and copy before ActivateFirmware: once that is sent the firmware
     // device pulses its reset line and the harness resets this board.
-    if !staged_image_matches(flash) {
+    if !staged_image_matches(flash, boot, image_size) {
         return Ok(false);
     }
-    if !copy_staged_to_boot_flash(flash, boot) {
+    if !copy_staged_to_boot_flash(flash, boot, image_size) {
         return Ok(false);
     }
 
@@ -575,6 +653,15 @@ fn run_update(
 
 #[entry]
 fn entry() {
+    pw_log::info!("BMC_VERSION:{}", boot_version() as u32);
+
+    // A non-zero version means this image already came round the loop, so the
+    // demo is over. Running the update again would never terminate.
+    if boot_version() != 0 {
+        let _ = syscall::debug_shutdown(Ok(()));
+        loop {}
+    }
+
     // SAFETY: mints this process's memory mappings once, at its entry point.
     let mmaps = unsafe { take_mmaps() };
     // SAFETY: sole pin creation site in this binary, at boot; the pins! table is this chip's true pin map.
@@ -604,6 +691,16 @@ fn entry() {
         }
     };
 
+    let image_size = match boot_image_size(&mut boot) {
+        Ok(size) => size,
+        Err(e) => {
+            pw_log::error!("UA: boot header read failed: {:08x}", e.0.get() as u32);
+            let _ = syscall::debug_shutdown(Err(Error::Internal));
+            loop {}
+        }
+    };
+    pw_log::info!("UA: own image is {} bytes", image_size as u32);
+
     let transport = MctpPldmTransport::new(IpcMctpClient::new(handle::MCTP));
 
     if transport.stack().set_eid(UA_EID).is_err() {
@@ -615,7 +712,7 @@ fn entry() {
     pw_log::info!("UA: driving an update against EID {}", FD_EID as u32);
     // Only failures report a verdict here. On success this board's verdict comes
     // from the delivered image once the reset boots it out of flash.
-    match run_update(&transport, &mut flash, &mut boot) {
+    match run_update(&transport, &mut flash, &mut boot, image_size) {
         Ok(true) => {
             pw_log::info!("UA: update staged and copied, waiting for the reset");
         }
