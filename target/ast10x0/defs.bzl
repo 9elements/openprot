@@ -9,6 +9,37 @@ TARGET_COMPATIBLE_WITH = select({
     "//conditions:default": ["@platforms//:incompatible"],
 })
 
+def _kernel_build_transition_impl(_settings, _attr):
+    return {str(Label("@pigweed//pw_kernel/userspace:is_app_build")): False}
+
+# system_image's kernel transition clears userspace_build but leaves
+# is_app_build alone, so an image reached from inside an app build keeps the
+# userspace log backend and pulls in syscall_user, which userspace_build =
+# False marks incompatible. Clear the flag before entering the image.
+_kernel_build_transition = transition(
+    implementation = _kernel_build_transition_impl,
+    inputs = [],
+    outputs = [str(Label("@pigweed//pw_kernel/userspace:is_app_build"))],
+)
+
+def _system_image_bin_impl(ctx):
+    # A transitioned label attr arrives as a list, one entry per output config.
+    return DefaultInfo(files = depset([ctx.attr.image[0][SystemImageInfo].bin]))
+
+system_image_bin = rule(
+    implementation = _system_image_bin_impl,
+    doc = "Exposes a system_image's raw .bin on its own, so a genrule can " +
+          "consume it without also picking up the .elf.",
+    attrs = {
+        "image": attr.label(
+            doc = "The system_image to take the .bin from.",
+            mandatory = True,
+            providers = [SystemImageInfo],
+            cfg = _kernel_build_transition,
+        ),
+    },
+)
+
 def _system_image_test_impl(ctx):
     image_info = ctx.attr.image[SystemImageInfo]
     executable_symlink = ctx.actions.declare_file(ctx.label.name)

@@ -51,6 +51,7 @@ use pw_status::Error;
 use userspace::{entry, syscall};
 use util_error::ErrorCode;
 use util_region::Region;
+use util_types::PowerOf2Usize;
 
 use app_pldm_fd::handle;
 use app_pldm_fd_regions::{take_mmaps, Spi1Cs0Window, Spi1Regs};
@@ -62,9 +63,6 @@ type Backend = flash_backend::Ast10x0Spi1FlashDriver<Spi1Regs>;
 const FD_EID: u8 = 8;
 /// The update agent's EID on the mock BMC.
 const UA_EID: u8 = 9;
-
-/// Size of the demo image, in bytes. Must match the update agent's blob.
-const IMAGE_SIZE: usize = 1024;
 
 /// This device's UUID, the one descriptor QueryDeviceIdentifiers reports. The
 /// update agent holds the same value and refuses to update anything else.
@@ -232,13 +230,23 @@ fn new_ready_core<OutP: OutputPin, InP: InputPin>(
     Ok(core)
 }
 
-/// The byte the demo image carries at `offset`.
-///
-/// Offset-dependent so a duplicated, reordered, or truncated chunk fails
-/// verification instead of slipping through. The update agent generates the
-/// same sequence.
-fn expected_byte(offset: usize) -> u8 {
-    (offset % 251) as u8
+/// The image's byte count, as the update agent declared it in UpdateComponent.
+/// `PassComponentTable` leaves it unset, but every download-phase callback runs
+/// after UpdateComponent, so it is populated by then.
+fn image_size(component: &FirmwareComponent) -> usize {
+    component.comp_image_size.unwrap_or(0) as usize
+}
+
+/// FNV-1a seed and multiplier. Order-sensitive, so a readback that is
+/// truncated, padded, or out of order fails even when it holds the same bytes.
+const CHECKSUM_INIT: u32 = 0x811c_9dc5;
+
+fn checksum(mut acc: u32, data: &[u8]) -> u32 {
+    for byte in data {
+        acc ^= *byte as u32;
+        acc = acc.wrapping_mul(0x0100_0193);
+    }
+    acc
 }
 
 /// Firmware-device operations for the demo: program the image into SPI1 CS0 as it
@@ -248,17 +256,23 @@ fn expected_byte(offset: usize) -> u8 {
 /// `RefCell`.
 struct DemoFdOps {
     flash: RefCell<BlockingFlash<Backend, NoWaitBlocking>>,
+    sector: PowerOf2Usize,
+    erased_through: Cell<usize>,
     bytes_received: Cell<usize>,
+    checksum: Cell<u32>,
     corrupt: Cell<bool>,
     verified: Cell<bool>,
     activated: Cell<bool>,
 }
 
 impl DemoFdOps {
-    fn new(flash: BlockingFlash<Backend, NoWaitBlocking>) -> Self {
+    fn new(flash: BlockingFlash<Backend, NoWaitBlocking>, sector: PowerOf2Usize) -> Self {
         DemoFdOps {
             flash: RefCell::new(flash),
+            sector,
+            erased_through: Cell::new(0),
             bytes_received: Cell::new(0),
+            checksum: Cell::new(CHECKSUM_INIT),
             corrupt: Cell::new(false),
             verified: Cell::new(false),
             activated: Cell::new(false),
@@ -340,12 +354,12 @@ impl FdOps for DemoFdOps {
 
     fn query_download_offset_and_length(
         &self,
-        _component: &FirmwareComponent,
+        component: &FirmwareComponent,
     ) -> Result<(usize, usize), FdOpsError> {
         // The state machine keeps no cursor of its own: whatever this returns is
         // the offset of the next RequestFirmwareData, verbatim.
         let done = self.bytes_received.get();
-        Ok((done, IMAGE_SIZE - done))
+        Ok((done, image_size(component).saturating_sub(done)))
     }
 
     fn download_fw_data(
@@ -360,18 +374,24 @@ impl FdOps for DemoFdOps {
             // set bits back to 1, so reprogramming it would corrupt the image.
             return Ok(TransferResult::TransferSuccess);
         }
-        for (i, byte) in data.iter().enumerate() {
-            if *byte != expected_byte(offset + i) {
+        let mut flash = self.flash.borrow_mut();
+        // Erase lazily, a sector ahead of the write, so the image's real size
+        // does not have to be known before the first chunk arrives.
+        let end = offset + data.len();
+        while self.erased_through.get() < end {
+            let at = self.erased_through.get();
+            if let Err(e) = flash.erase(FlashAddress::new(IMAGE_BASE + at as u32), self.sector) {
                 self.corrupt.set(true);
-                pw_log::error!("FD: byte {} is wrong", (offset + i) as u32);
+                pw_log::error!(
+                    "FD: erase at {} failed: {:08x}",
+                    at as u32,
+                    e.0.get() as u32
+                );
                 return Ok(TransferResult::FdAbortedTransfer);
             }
+            self.erased_through.set(at + self.sector.get());
         }
-        if let Err(e) = self
-            .flash
-            .borrow_mut()
-            .program(FlashAddress::new(IMAGE_BASE + offset as u32), data)
-        {
+        if let Err(e) = flash.program(FlashAddress::new(IMAGE_BASE + offset as u32), data) {
             self.corrupt.set(true);
             pw_log::error!(
                 "FD: program at {} failed: {:08x}",
@@ -380,20 +400,26 @@ impl FdOps for DemoFdOps {
             );
             return Ok(TransferResult::FdAbortedTransfer);
         }
+        self.checksum.set(checksum(self.checksum.get(), data));
         self.bytes_received.set(done + data.len());
         Ok(TransferResult::TransferSuccess)
     }
 
-    fn is_download_complete(&self, _component: &FirmwareComponent) -> bool {
-        self.bytes_received.get() >= IMAGE_SIZE
+    fn is_download_complete(&self, component: &FirmwareComponent) -> bool {
+        self.bytes_received.get() >= image_size(component)
     }
 
     fn query_download_progress(
         &self,
-        _component: &FirmwareComponent,
+        component: &FirmwareComponent,
         progress_percent: &mut ProgressPercent,
     ) -> Result<(), FdOpsError> {
-        let pct = (self.bytes_received.get() * 100 / IMAGE_SIZE) as u8;
+        let size = image_size(component);
+        let pct = if size == 0 {
+            0
+        } else {
+            (self.bytes_received.get() * 100 / size) as u8
+        };
         progress_percent
             .set_value(pct.min(100))
             .map_err(|_| FdOpsError::FwDownloadError)?;
@@ -402,10 +428,13 @@ impl FdOps for DemoFdOps {
 
     fn verify(
         &self,
-        _component: &FirmwareComponent,
+        component: &FirmwareComponent,
         _progress_percent: &mut ProgressPercent,
     ) -> Result<VerifyResult, FdOpsError> {
-        if self.corrupt.get() || self.bytes_received.get() < IMAGE_SIZE {
+        let size = image_size(component);
+        // A zero size would make the readback loop and the comparison below
+        // both vacuous, reporting success over an empty flash.
+        if size == 0 || self.corrupt.get() || self.bytes_received.get() < size {
             pw_log::error!(
                 "FD: image incomplete, {} bytes",
                 self.bytes_received.get() as u32
@@ -415,8 +444,10 @@ impl FdOps for DemoFdOps {
 
         let mut flash = self.flash.borrow_mut();
         let mut buf = [0u8; READBACK_CHUNK];
-        for base in (0..IMAGE_SIZE).step_by(READBACK_CHUNK) {
-            if let Err(e) = flash.read(FlashAddress::new(IMAGE_BASE + base as u32), &mut buf) {
+        let mut read_back = CHECKSUM_INIT;
+        for base in (0..size).step_by(READBACK_CHUNK) {
+            let n = (size - base).min(READBACK_CHUNK);
+            if let Err(e) = flash.read(FlashAddress::new(IMAGE_BASE + base as u32), &mut buf[..n]) {
                 pw_log::error!(
                     "FD: read at {} failed: {:08x}",
                     base as u32,
@@ -424,16 +455,19 @@ impl FdOps for DemoFdOps {
                 );
                 return Ok(VerifyResult::VerifyGenericError);
             }
-            for (i, byte) in buf.iter().enumerate() {
-                if *byte != expected_byte(base + i) {
-                    pw_log::error!("FD: flash byte {} is wrong", (base + i) as u32);
-                    return Ok(VerifyResult::VerifyGenericError);
-                }
-            }
+            read_back = checksum(read_back, &buf[..n]);
+        }
+        if read_back != self.checksum.get() {
+            pw_log::error!(
+                "FD: flash checksum {:08x}, expected {:08x}",
+                read_back as u32,
+                self.checksum.get() as u32
+            );
+            return Ok(VerifyResult::VerifyGenericError);
         }
 
         self.verified.set(true);
-        pw_log::info!("FD: image verified in flash, {} bytes", IMAGE_SIZE as u32);
+        pw_log::info!("FD: image verified in flash, {} bytes", size as u32);
 
         // Last flash access on this side, so hand the staging flash to the mock
         // BMC: release SPIM0's input from our SPI1 master, then flip the
@@ -472,11 +506,11 @@ impl FdOps for DemoFdOps {
     }
 }
 
-/// Bring up SPI1 and clear the sector the image lands in.
+/// Bring up SPI1 and report its sector size, which the download erases by.
 fn init_flash(
     spi1_regs: Region<Spi1Regs>,
     spi1_cs0_window: Region<Spi1Cs0Window>,
-) -> Result<BlockingFlash<Backend, NoWaitBlocking>, ErrorCode> {
+) -> Result<(BlockingFlash<Backend, NoWaitBlocking>, PowerOf2Usize), ErrorCode> {
     // The kernel target applied the SPI1 pinmux and the SPIM0 route to the BMC
     // flash before any process started.
     let driver = Backend::new(spi1_regs, spi1_cs0_window)?;
@@ -490,15 +524,14 @@ fn init_flash(
         capacity.get() as u32,
         sector.get() as u32
     );
-    flash.erase(FlashAddress::new(IMAGE_BASE), sector)?;
-    Ok(flash)
+    Ok((flash, sector))
 }
 
 #[entry]
 fn entry() {
     // SAFETY: mints this process's memory mappings once, at its entry point.
     let mmaps = unsafe { take_mmaps() };
-    let flash = match init_flash(mmaps.spi1_regs, mmaps.spi1_cs0_window) {
+    let (flash, sector) = match init_flash(mmaps.spi1_regs, mmaps.spi1_cs0_window) {
         Ok(flash) => flash,
         Err(e) => {
             pw_log::error!("FD: flash init failed: {:08x}", e.0.get() as u32);
@@ -506,7 +539,7 @@ fn entry() {
             loop {}
         }
     };
-    let fd_ops = DemoFdOps::new(flash);
+    let fd_ops = DemoFdOps::new(flash, sector);
 
     // SAFETY: sole pin creation site in this binary; the pins! table is this chip's true pin map.
     let pins = unsafe { create_pins() };

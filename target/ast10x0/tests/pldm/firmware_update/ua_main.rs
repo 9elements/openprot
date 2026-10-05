@@ -23,6 +23,7 @@ use ast10x0_peripherals::create_pins;
 use ast10x0_peripherals::gpio::{bind_gpio, GpioBlock, OutputPin};
 use flash_backend::NoWaitBlocking;
 use hal_flash::{BlockingFlash, Flash, FlashAddress};
+use hello_world_image_blob::IMAGE;
 use openprot_mctp_client_ipc::IpcMctpClient;
 use openprot_pldm_service::error::PldmMemError;
 use openprot_pldm_service::{MctpPldmTransport, PldmServiceError};
@@ -67,8 +68,9 @@ const UA_EID: u8 = 9;
 /// The firmware device's EID on the RoT.
 const FD_EID: u8 = 8;
 
-/// Size of the demo image, in bytes. Must match the firmware device's.
-const IMAGE_SIZE: u32 = 1024;
+/// Size of the image handed over, in bytes. The firmware device learns it from
+/// UpdateComponent rather than being told separately.
+const IMAGE_SIZE: u32 = IMAGE.len() as u32;
 
 /// Where the firmware device stages the image in the shared flash. Must match
 /// the firmware device's.
@@ -95,15 +97,9 @@ const SERVE_TIMEOUT_MILLIS: u32 = 30_000;
 /// Upper bound on firmware-device-initiated requests served before giving up.
 /// A clean run is ceil(IMAGE_SIZE / MAX_TRANSFER_SIZE) RequestFirmwareData plus
 /// TransferComplete, VerifyComplete, and ApplyComplete.
-const MAX_SERVED_REQUESTS: u32 = 64;
+const MAX_SERVED_REQUESTS: u32 = IMAGE_SIZE.div_ceil(MAX_TRANSFER_SIZE as u32) + 3;
 
 const UA_BUF_SIZE: usize = 1024;
-
-/// The byte the demo image carries at `offset`. The firmware device generates
-/// the same sequence and rejects anything that does not match.
-fn expected_byte(offset: usize) -> u8 {
-    (offset % 251) as u8
-}
 
 /// Build a fixed-size PLDM firmware version string.
 fn fw_string(s: &str) -> PldmFirmwareString {
@@ -164,11 +160,14 @@ fn serve_fd_request(
                 pw_log::error!("UA: FD asked for {} bytes, over the MTU", length as u32);
                 return Ok(0);
             }
-            let mut chunk = [0u8; MAX_TRANSFER_SIZE];
-            for (i, byte) in chunk[..length].iter_mut().enumerate() {
-                *byte = expected_byte(offset + i);
-            }
-            let msg = RequestFirmwareDataResponse::new(instance_id, success, &chunk[..length]);
+            let chunk = offset
+                .checked_add(length)
+                .and_then(|end| IMAGE.get(offset..end));
+            let Some(chunk) = chunk else {
+                pw_log::error!("UA: FD asked for bytes past the end of the image");
+                return Ok(0);
+            };
+            let msg = RequestFirmwareDataResponse::new(instance_id, success, chunk);
             PldmCodecWithLifetime::encode(&msg, resp)
         }
         Ok(FwUpdateCmd::TransferComplete) => {
@@ -231,8 +230,10 @@ fn init_flash(
 /// agent handed over.
 fn staged_image_matches(flash: &mut BlockingFlash<Backend, NoWaitBlocking>) -> bool {
     let mut buf = [0u8; READBACK_CHUNK];
-    for base in (0..IMAGE_SIZE as usize).step_by(READBACK_CHUNK) {
-        if let Err(e) = flash.read(FlashAddress::new(IMAGE_BASE + base as u32), &mut buf) {
+    for base in (0..IMAGE.len()).step_by(READBACK_CHUNK) {
+        let n = (IMAGE.len() - base).min(READBACK_CHUNK);
+        let buf = &mut buf[..n];
+        if let Err(e) = flash.read(FlashAddress::new(IMAGE_BASE + base as u32), buf) {
             pw_log::error!(
                 "UA: read at {} failed: {:08x}",
                 base as u32,
@@ -240,11 +241,9 @@ fn staged_image_matches(flash: &mut BlockingFlash<Backend, NoWaitBlocking>) -> b
             );
             return false;
         }
-        for (i, byte) in buf.iter().enumerate() {
-            if *byte != expected_byte(base + i) {
-                pw_log::error!("UA: staged byte {} is wrong", (base + i) as u32);
-                return false;
-            }
+        if buf != &IMAGE[base..base + n] {
+            pw_log::error!("UA: staged bytes differ at {}", base as u32);
+            return false;
         }
     }
     pw_log::info!("UA: read back {} staged bytes intact", IMAGE_SIZE as u32);
