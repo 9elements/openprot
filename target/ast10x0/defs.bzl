@@ -31,10 +31,17 @@ def _system_image_test_impl(ctx):
             runfiles.merge(ctx.attr.slave_image[DefaultInfo].default_runfiles),
         )
 
-    return [DefaultInfo(
+    providers = [DefaultInfo(
         executable = executable_symlink,
         runfiles = runfiles,
     )]
+
+    # Absent on flash_system_image_test, which shares this implementation.
+    if getattr(ctx.attr, "reboot_from_flash", False):
+        providers.append(RunEnvironmentInfo(
+            environment = {"AST10X0_REBOOT_FROM_FLASH": "1"},
+        ))
+    return providers
 
 def _flash_system_image_test_impl(ctx):
     default_info = _system_image_test_impl(ctx)[0]
@@ -68,6 +75,11 @@ system_image_test = rule(
             providers = [SystemImageInfo],
             executable = True,
             cfg = "target",
+        ),
+        "reboot_from_flash": attr.bool(
+            doc = "After the first verdict, restart the board with FWSPICK low " +
+                  "and demand a second verdict from the image in flash.",
+            default = False,
         ),
         "slave_image": attr.label(
             doc = "Optional slave system_image for paired two-device tests.",

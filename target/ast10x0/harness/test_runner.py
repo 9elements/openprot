@@ -25,6 +25,7 @@ import tomllib
 from pathlib import Path
 
 AST1060_EVB_PI_HOST = "AST1060_EVB_PI_HOST"
+AST10X0_REBOOT_FROM_FLASH = "AST10X0_REBOOT_FROM_FLASH"
 
 # ── pw_tokenizer discovery ────────────────────────────────────────────────────
 # When run as a Bazel py_binary, pw_tokenizer is already on sys.path via deps.
@@ -338,6 +339,8 @@ def _run_remote(
     )
     if args.parse_only:
         remote_cmd += " --stream-only"
+    if os.environ.get(AST10X0_REBOOT_FROM_FLASH):
+        remote_cmd += " --reboot-from-flash"
     if remote_slave_fw:
         device_b = config["device_b"]
         remote_cmd += (

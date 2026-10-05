@@ -61,6 +61,28 @@ def _sequence_to_fwspick_mode(
     time.sleep(1)
 
 
+def _sequence_to_normal_mode(
+    srst_pin: int, fwspick_pin: int, port: serial.Serial
+) -> None:
+    """Restart the board with FWSPICK low, so the boot ROM reads flash."""
+    print(
+        f"[{time.monotonic() - _T0:7.2f}] resetting with FWSPICK low; board must"
+        " boot from flash now",
+        file=sys.stderr,
+    )
+    _gpio_set(srst_pin, "dl")
+    time.sleep(0.1)
+    # Drains the previous boot's verdict, which would otherwise match instantly.
+    port.timeout = 0.1
+    port.read(4096)
+    _gpio_set(fwspick_pin, "pn dl")
+    time.sleep(0.1)
+    _gpio_set(srst_pin, "dl")
+    time.sleep(0.5)
+    _gpio_set(srst_pin, "dh")
+    time.sleep(2)
+
+
 def _mirror_reset_passthrough(
     pin: int,
     srst_pin: int,
@@ -165,14 +187,27 @@ _SUCCESS_SENTINEL = b"TEST_RESULT:PASS"
 _FAILURE_SENTINELS = [b"TEST_RESULT:FAIL", b"panic"]
 
 
-def _stream_uart(port: serial.Serial, lock=None, label: str = "") -> bool:
+def _stream_uart(
+    port: serial.Serial,
+    lock=None,
+    label: str = "",
+    timeout_s: float | None = None,
+) -> bool:
     port.timeout = 1.0
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
     buf = b""
     # Held back so the prefix only ever lands at a line start: a pw_tokenizer
     # $base64 frame is terminated by the newline, never split across one.
     partial = b""
     while True:
         data = port.read(1024)
+        if deadline is not None and time.monotonic() > deadline:
+            print(
+                f"[{time.monotonic() - _T0:7.2f}] no verdict in {timeout_s:.0f}s;"
+                " board is silent",
+                file=sys.stderr,
+            )
+            return False
         if data:
             partial += data
             lines = partial.split(b"\n")
@@ -325,6 +360,11 @@ def main() -> int:
         help="Skip GPIO sequences and firmware upload; stream raw UART bytes only",
     )
     parser.add_argument(
+        "--reboot-from-flash",
+        action="store_true",
+        help="After the first verdict, restart with FWSPICK low and demand a second",
+    )
+    parser.add_argument(
         "--slave-firmware",
         default=None,
         help="Slave firmware binary. When present, enables paired two-device mode.",
@@ -404,6 +444,9 @@ def main() -> int:
                 return 1
             _upload_firmware(port, firmware_path)
         result = _stream_uart(port)
+        if result and args.reboot_from_flash:
+            _sequence_to_normal_mode(args.srst_pin, args.fwspick_pin, port)
+            result = _stream_uart(port, timeout_s=60.0)
     except KeyboardInterrupt:
         pass
     finally:
