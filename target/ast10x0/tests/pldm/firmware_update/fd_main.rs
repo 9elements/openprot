@@ -134,13 +134,18 @@ impl DelayNs for BoardDelay {
     }
 }
 
-/// How often [`wait_for_mock_bmc_reset`] re-reads the alive line while waiting.
+/// How often [`wait_for_boot_status`] re-reads the alive line while waiting.
 const ALIVE_POLL_INTERVAL_MICROS: u32 = 10_000;
 
-/// How long [`wait_for_mock_bmc_reset`] waits for the mock BMC to go quiet.
-/// By the time it looks the press is over, so this is a sanity bound rather
+/// How long to wait for the mock BMC to go quiet after the reset request. By
+/// the time this side looks the press is over, so it is a sanity bound rather
 /// than the expected cost.
 const RESET_WINDOW: Duration = Duration::from_secs(1);
+
+/// How long to wait for the mock BMC's heartbeat to appear after the reset.
+/// Covers the boot ROM reading the SPI NOR and the image starting. Nobody has
+/// timed that yet, so the number is a guess on the high side.
+const BOOT_WINDOW: Duration = Duration::from_secs(10);
 
 /// How long GPIOJ0 is held high to request the reset. The Pi's mirror samples
 /// every 50ms plus a `pinctrl` subprocess, so the press spans several samples.
@@ -152,9 +157,9 @@ const RESET_PULSE: Duration = Duration::from_millis(500);
 /// test proves, only that a real RequestUpdate, arriving over the wire from
 /// the update agent, drives the orchestrator through to activation.
 ///
-/// `execute` never manufactures the reboot's outcome: it only drives the line,
-/// and [`wait_for_mock_bmc_reset`] supplies `Event::BootConfirmed` from
-/// outside, once the mock BMC's alive line actually says so.
+/// `execute` never manufactures the reboot's outcome: it only drives the line.
+/// `Event::BootConfirmed` comes from outside, from [`wait_for_heartbeat`], once
+/// the mock BMC's alive line has dropped and then started toggling.
 struct TestPlatform<OutP, InP> {
     reset: GpioResetControl<OutP, BoardDelay, PassthroughReset>,
     ready: GpioReadyMonitor<InP>,
@@ -182,19 +187,43 @@ impl<OutP: OutputPin, InP: InputPin> Platform for TestPlatform<OutP, InP> {
     }
 }
 
-/// Watches the mock BMC's alive line (GPIOH4) until it falls or
-/// [`RESET_WINDOW`] elapses, returning whether the fall was observed in time.
-/// The mock BMC drives this line high for as long as it is running, so a fall
-/// is the reset landing. It does not come back: the harness loads that image
-/// into SRAM over UART, and the reset it performs boots the board from its SPI
-/// NOR instead, so the fall is all this side can observe. A read error is
-/// treated the same as still alive, matching `CheckpointWalk`'s existing
-/// silence-tolerance convention.
-fn wait_for_mock_bmc_reset<InP: InputPin>(alive: &mut GpioReadyMonitor<InP>) -> bool {
-    let deadline_us = RESET_WINDOW.as_micros() as u64;
+/// Polls the mock BMC's alive line (GPIOH4) until it reads `want`, or gives up
+/// after `window`. The image doing the update holds the line high, so the drop
+/// is the reset landing. What comes back is the next image's heartbeat, which
+/// [`wait_for_heartbeat`] watches for instead. A read error counts as no
+/// change, matching `CheckpointWalk`'s existing silence-tolerance convention.
+fn wait_for_boot_status<InP: InputPin>(
+    alive: &mut GpioReadyMonitor<InP>,
+    want: BootStatus,
+    window: Duration,
+) -> bool {
+    let deadline_us = window.as_micros() as u64;
     let mut waited_us: u64 = 0;
     loop {
-        if matches!(alive.boot_status(), Ok(BootStatus::Booting)) {
+        if matches!(alive.boot_status(), Ok(status) if status == want) {
+            return true;
+        }
+        if waited_us >= deadline_us {
+            return false;
+        }
+        BoardDelay.delay_us(ALIVE_POLL_INTERVAL_MICROS);
+        waited_us += ALIVE_POLL_INTERVAL_MICROS as u64;
+    }
+}
+
+/// Polls the mock BMC's alive line until its level changes or `window` elapses.
+///
+/// The image that boots after an update toggles the line, so a change is that
+/// image running. A level cannot say the same: the pin latch holds whatever was
+/// written last even after the process stops, so a stale high from the previous
+/// image is indistinguishable from a fresh boot. A read error counts as no
+/// change, same as [`wait_for_boot_status`].
+fn wait_for_heartbeat<InP: InputPin>(alive: &mut GpioReadyMonitor<InP>, window: Duration) -> bool {
+    let first = alive.boot_status().unwrap_or(BootStatus::Booting);
+    let deadline_us = window.as_micros() as u64;
+    let mut waited_us: u64 = 0;
+    loop {
+        if matches!(alive.boot_status(), Ok(status) if status != first) {
             return true;
         }
         if waited_us >= deadline_us {
@@ -648,15 +677,28 @@ fn entry() {
     // The real verify() outcome, already settled by the time run_terminus
     // returns, becomes the event that lets the orchestrator leave Updating.
     if orchestrator_reached_updating {
-        orchestrator.dispatch(&mut platform, verify_outcome_event(fd_ops.image_is_good()));
-        // The alive line going quiet is the whole proof: it says the reset
-        // request travelled through the Pi and landed on the mock BMC. It does
-        // not say new firmware booted — nothing on this side can observe that.
-        let reset_landed = wait_for_mock_bmc_reset(&mut platform.ready);
-        if reset_landed {
+        let image_is_good = fd_ops.image_is_good();
+        orchestrator.dispatch(&mut platform, verify_outcome_event(image_is_good));
+        // Only a verified image is activated, so only then is there a reset to
+        // watch for. A rejected one emits DiscardStaged and goes back to Ready,
+        // where a BootConfirmed would commit the anti-rollback floor for the
+        // image the device just threw away.
+        //
+        // Wait for the line to drop, then to start toggling. The drop means
+        // the reset request got through the Pi to the mock BMC. The toggling
+        // means the image it booted into is running, and unlike a level it
+        // cannot be left behind by the image that just went away. This demo
+        // has no health check, so the heartbeat is what stands in for one.
+        if !image_is_good {
+            pw_log::error!("FD: image rejected, nothing to activate");
+        } else if !wait_for_boot_status(&mut platform.ready, BootStatus::Booting, RESET_WINDOW) {
+            pw_log::error!("FD: mock BMC kept running; the reset request never reached it");
+            orchestrator.dispatch(&mut platform, Event::CommitTimeout);
+        } else if wait_for_heartbeat(&mut platform.ready, BOOT_WINDOW) {
             orchestrator.dispatch(&mut platform, Event::BootConfirmed(ORCH_COMPONENT));
         } else {
-            pw_log::error!("FD: mock BMC kept running; the reset request never reached it");
+            pw_log::error!("FD: mock BMC never heartbeated after the reset");
+            orchestrator.dispatch(&mut platform, Event::CommitTimeout);
         }
     }
     let orchestrator_closed_the_loop =

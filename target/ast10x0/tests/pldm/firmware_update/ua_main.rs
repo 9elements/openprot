@@ -74,6 +74,15 @@ const FD_EID: u8 = 8;
 /// the firmware device's.
 const IMAGE_BASE: u32 = 0x10_0000;
 
+/// Half-period of the heartbeat the post-update image drives on GPIOH5. The RoT
+/// samples the line every 10ms, so this has to span several samples or the
+/// toggle aliases into a steady level.
+const HEARTBEAT_HALF_PERIOD_MICROS: u64 = 100_000;
+
+/// How long the post-update image heartbeats before it reports and stops. Long
+/// enough for the RoT to catch it, short enough not to stall the run.
+const HEARTBEAT_MICROS: u64 = 3_000_000;
+
 /// How much of the staged image is read back at a time.
 const READBACK_CHUNK: usize = 256;
 
@@ -87,6 +96,14 @@ const SB_HEADER_OFFSET: usize = 0x400;
 /// the second boot prints, so it can only have come from the round trip.
 #[used]
 pub static BOOT_VERSION: u32 = 0;
+
+/// Busy-waits on the monotonic system clock. The board's `delay_us` is an
+/// uncalibrated spin loop and returns several times too early.
+fn busy_wait_micros(us: u64) {
+    use userspace::time::Duration;
+    let until = syscall::debug_clock_now() + Duration::from_micros(us);
+    while syscall::debug_clock_now() < until {}
+}
 
 /// Read the version out of the running image. Volatile because these bytes are
 /// patched after compilation, so the initializer above is not the truth and the
@@ -655,23 +672,40 @@ fn run_update(
 fn entry() {
     pw_log::info!("BMC_VERSION:{}", boot_version() as u32);
 
-    // A non-zero version means this image already came round the loop, so the
-    // demo is over. Running the update again would never terminate.
-    if boot_version() != 0 {
-        let _ = syscall::debug_shutdown(Ok(()));
-        loop {}
-    }
-
     // SAFETY: mints this process's memory mappings once, at its entry point.
     let mmaps = unsafe { take_mmaps() };
     // SAFETY: sole pin creation site in this binary, at boot; the pins! table is this chip's true pin map.
     let pins = unsafe { create_pins() };
     let gpio = GpioBlock::new(mmaps.gpio_regs);
-    // GPIOH5: this board's alive line, driven high for as long as it is running.
-    // The RoT watches it fall to confirm the reset it requested over GPIOJ0
-    // actually landed. Jumper: this pin -> RoT's GPIOH4.
+    // GPIOH5: this board's alive line. Jumper: this pin -> RoT's GPIOH4.
+    //
+    // One wire, two meanings. Held high while this image does the update, so
+    // the RoT sees it drop when the reset it asked for over GPIOJ0 lands.
+    // Toggled by the image that boots afterwards, because a level cannot prove
+    // that one is running: the pin latch keeps whatever was written last, even
+    // after the process stops, so a stale high looks exactly like a fresh boot.
+    // A toggle only keeps going while code does.
     let mut alive_pin = bind_gpio(pins.scu414_29, &gpio).into_output();
     let _ = alive_pin.set_high();
+
+    // A non-zero version means this image already came round the loop, so the
+    // demo is over. Running the update again would never terminate. Heartbeat
+    // first, long enough for the RoT to see it, then report and stop: the
+    // kernel's shutdown hook prints the verdict and parks, so nothing can
+    // drive the line after this.
+    if boot_version() != 0 {
+        pw_log::info!("UA: updated image running, heartbeating for the RoT");
+        let mut beat_us: u64 = 0;
+        while beat_us < HEARTBEAT_MICROS {
+            let _ = alive_pin.set_low();
+            busy_wait_micros(HEARTBEAT_HALF_PERIOD_MICROS);
+            let _ = alive_pin.set_high();
+            busy_wait_micros(HEARTBEAT_HALF_PERIOD_MICROS);
+            beat_us += 2 * HEARTBEAT_HALF_PERIOD_MICROS;
+        }
+        let _ = syscall::debug_shutdown(Ok(()));
+        loop {}
+    }
 
     let mut flash = match init_flash(mmaps.spi1_regs, mmaps.spi1_cs0_window) {
         Ok(flash) => flash,
