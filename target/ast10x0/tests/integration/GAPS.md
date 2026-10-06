@@ -29,6 +29,48 @@ on its state from in there. The only observations from outside the guest
 are the UART sentinel and the CS1 backing file, and only the happy path
 checks the latter.
 
+## Against the demo script in PR 518
+
+`docs/ocp-demo.md`, proposed in OpenPRoT/openprot#518, is the sequence the
+demo is measured by. It is docs only and still open, so this is a
+comparison and not yet a list of defects.
+
+Covered by `full_update`: the RoT boots first and holds the device in
+reset, releases it, supervises the walk, takes a Type 5 update through
+inventory, request, pass-component, update-component, the data loop,
+transfer, verify and apply, authenticates the new blob, resets the device,
+and sees it boot what it was given.
+
+Not covered, in the order they would have to be decided:
+
+- Activation. The 518 Type 5 diagram ends at ApplyComplete, with
+  `ComponentActivationMethods.Automatic` in the parameter table and no
+  ActivateFirmware anywhere. The device advertises self-contained
+  activation and the agent does send ActivateFirmware. That is a different
+  flow, not a different flag: under 518 the RoT writing the image and
+  resetting the device is the activation, the firmware device's
+  `activate()` never runs, and the `PerformActivate` decision in the gate
+  has nothing producing it.
+- The pending-reset handshake: a pending reset signal to the device, the
+  device preparing for shutdown, and an acknowledgement. This exists
+  nowhere, not in DSP0267, not in pldm-lib, not in the orchestrator.
+- Type 0 terminus discovery: GetPLDMTypes, GetPLDMVersion above 1.2, and
+  GetPLDMCommands covering inventory and update. The device answers these
+  already, through the control context in pldm-lib, so this is an addition
+  to the agent in the test.
+- Authenticating the running image before the first release. The verifier
+  reads nothing and the device table carries no layout, so the first boot
+  is unverified. Doing it for real means two processes mapping the FMC,
+  with the firmware device writing CS1 while the RoT reads it.
+- Updating the backup partition after the commit. #512 merged, but the
+  component here binds `SvnFloorBinding::SelfManaged`, and since 993219b8
+  a self-managed component's slots are left to the device. The re-sync
+  cannot trigger until a scenario variant binds an eRoT floor.
+- Boot progress over MCTP, and the shape of the other side. In 518 the
+  managed device is one device that is the update agent, the reset target
+  and the progress reporter at once. Here those are two apps, and progress
+  arrives on an IPC channel.
+
 ## Arcs of the update state machine with no scenario
 
 - Cancel mid-transfer. The agent's `CancelUpdate` and the `AckCancel` that
