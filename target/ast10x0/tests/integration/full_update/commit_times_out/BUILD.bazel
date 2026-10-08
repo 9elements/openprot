@@ -1,0 +1,27 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+# The full scenario's third negative: the device boots the new image and
+# nothing confirms it, so the commit window expires.
+#
+# The update succeeds and the walk after it is green, which is what makes
+# this different from the two scenarios either side of it: the one thing
+# missing is the confirmation. The platform locks rather than commit an
+# image nothing has vouched for.
+
+load("//target/ast10x0/tests/integration:scenario.bzl", "qemu_scenario")
+load("//target/ast10x0/tests/integration/full_update:apps.bzl", "APPS", "FLASH", "SYSTEM_CONFIG", "TARGET_DEPS", "TARGET_SRC")
+
+# bazel test --config=virt_ast10x0 //target/ast10x0/tests/integration/full_update/commit_times_out:commit_times_out_qemu_test
+qemu_scenario(
+    name = "commit_times_out_qemu",
+    apps = APPS,
+    cfgs = [
+        "rot_owns_verdict",
+        "commit_times_out",
+    ],
+    flash = FLASH,
+    system_config = SYSTEM_CONFIG,
+    target_deps = TARGET_DEPS,
+    target_src = TARGET_SRC,
+)

@@ -1,13 +1,13 @@
 # QEMU integration tests
 
-Eight scenarios, each its own system image, all running under QEMU with no
+Nine scenarios, each its own system image, all running under QEMU with no
 hardware. The AST1030 is the black box; everything it talks to is another
 app in the same image, reached through the same traits a real board wires.
 
 The runner greps one pass/fail sentinel per run, so one scenario per image
 is what lets a failure name itself.
 
-Three of the eight are the thing working. The other five are the thing
+Three of the nine are the thing working. The other six are the thing
 failing, and they pass when the failure is caught. A scenario that only
 ever passes proves nothing: the first version of the boot scenario passed
 with the device wedged, because it asserted the wrong thing. Each negative
@@ -24,6 +24,7 @@ fails rather than looking like the proof.
 | `full_update` | the whole demo script in one image | the device boots the image it was given |
 | `full_update/device_hangs` | the device never comes up | no update is ever offered |
 | `full_update/device_stays_down` | the device takes the update, then stays down | the RoT notices it never came back |
+| `full_update/commit_times_out` | the device boots the update and nothing confirms it | the commit window expires and the platform locks |
 
 A negative scenario is a package of its own, built from the same sources
 and the same system config with one `--cfg` added. `scenario.bzl` holds
@@ -47,6 +48,9 @@ The negatives, same shape:
     //target/ast10x0/tests/integration/mock_bmc/device_hangs:device_hangs_qemu_test
     //target/ast10x0/tests/integration/pldm_update/corrupt_image:corrupt_image_qemu_test
     //target/ast10x0/tests/integration/pldm_update/refused_update:refused_update_qemu_test
+    //target/ast10x0/tests/integration/full_update/device_hangs:device_hangs_qemu_test
+    //target/ast10x0/tests/integration/full_update/device_stays_down:device_stays_down_qemu_test
+    //target/ast10x0/tests/integration/full_update/commit_times_out:commit_times_out_qemu_test
 
 Bazel caches a passing test, so add `--nocache_test_results` when you want
 the run to actually happen. Checking for a flake:
@@ -141,7 +145,7 @@ device's own flow ends at activation and tells it nothing about the reset
 that has to follow. The first version had the device declaring it, and the
 run passed while the device never rebooted.
 
-Two negatives, and the second is the one that matters.
+Three negatives, and `device_stays_down` is the one that matters.
 `full_update/device_hangs` has the device never come up, so the first walk
 fails and no update is ever offered: that says the supervision half is
 live before the update half. `full_update/device_stays_down` lets the
@@ -157,7 +161,23 @@ Every scenario that stops at activation passes that run. Only one that
 waits for the device to boot what it was given can tell the difference,
 which is the whole reason this scenario exists.
 
-The RoT names which of the four outcomes it reached rather than returning
+`full_update/commit_times_out` is the third: the update succeeds, the walk
+after it is green, and the one thing missing is the confirmation. The
+activation opened the commit window and nothing closed it, so the commit
+watchdog expires and the machine locks rather than commit an image nothing
+has vouched for:
+
+    [INF] ORCH: both verdicts agree, activating
+    [INF] ORCH: the device reported ready, second boot
+    [INF] ORCH: nothing confirmed the boot, so the platform locked
+    TEST_RESULT:PASS
+
+The run loop arms that watchdog itself, through the shipped
+`BootWatchdogs`, because the state machine names `CommitTimeout` and owns
+no clock. The window is 25 seconds of guest time, which is about a second
+of test: under QEMU the guest clock runs far ahead of the host.
+
+The RoT names which of the six outcomes it reached rather than returning
 a bare failure, so a run that died somewhere else fails instead of looking
 like the proof.
 

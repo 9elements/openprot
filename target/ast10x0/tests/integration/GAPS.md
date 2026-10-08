@@ -73,12 +73,29 @@ Not covered, in the order they would have to be decided:
   answers it. The device's IPC handler refuses `ack_cancel` today.
 - `UpdateSecurityRevision` and the `SvnCommitPending` status, so
   `commit_self_svn_floor` has no path that reaches it.
-- Commit timeout, and the commit-or-lock latch that bounds the
-  activated-but-not-committed window.
 - Recovery preempting an update: `Updating` to `Recovering`, with the
   staged image discarded.
 - The spare slot re-sync after a commit, and the floor advance held until
   the spare has the image.
+
+## What the commit-timeout scenario does not say
+
+`full_update/commit_times_out` arms the commit watchdog from the scenario's
+own run loop, through the shipped `BootWatchdogs`. Nothing in the shipped
+image arms it: `arm_commit` has no caller outside tests, so the commit-or-lock
+bound the state machine promises is not wired anywhere yet. The scenario
+proves the state machine and the timer against the kernel clock with a real
+activation ahead of them, not that the shipped orchestrator would lock.
+
+`tests/orchestrator/runtime` scenario 6 already covers the timer in
+isolation, with no update in flight. What this adds is the window opened by
+an activation and a walk running through it.
+
+There is no floor to watch it fail to advance. The component binds
+`SvnFloorBinding::SelfManaged`, so the eRoT holds no floor here, and
+`Effect::LatchLockdown` returns an error from the driver rather than
+latching anything. The claim is the state: walk green, no confirmation,
+window expired, machine `Locked`.
 
 ## Assertions that are looser than they look
 

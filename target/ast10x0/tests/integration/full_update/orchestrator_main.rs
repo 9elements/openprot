@@ -27,6 +27,7 @@ use openprot_orchestrator_driver::{
     bring_up, request_update, Board, BoardCapabilities, ImageSource, Report, ReportSink,
     SvnFloorBinding, Verdict, Verifier,
 };
+use openprot_orchestrator_server::BootWatchdogs;
 use openprot_orchestrator_sm::{ComponentAttrs, ComponentId, Event, PowerOnResult, State};
 use orchestrator_capabilities::{
     BootControl, BootStatus, EvidenceReader, IncrementalVerifier, PollOutcome, StageProgress, Svn,
@@ -43,7 +44,7 @@ use util_io::{ByteReadError, ByteSource};
 use util_ipc::{AsyncChannelTransport, IpcHandle};
 
 use userspace::syscall::Signals;
-use userspace::time::{Clock, Instant, SystemClock};
+use userspace::time::{Clock, Duration, Instant, SystemClock};
 use userspace::{entry, syscall};
 
 use app_orchestrator::handle;
@@ -71,6 +72,13 @@ const BOOT_BUDGET_MILLIS: u64 = 10_000;
 /// How long the firmware device may take to answer a command.
 const DEVICE_TIMEOUT_MILLIS: u64 = 10_000;
 
+/// How long the activation has to be confirmed before the commit watchdog
+/// locks the platform. Past the second boot's budget, so a late device is
+/// judged by its walk and not by this. The scenario that waits the window
+/// out uses the same one: guest time under QEMU runs far ahead of the
+/// host, so 25 seconds of it costs about a second of test.
+const COMMIT_WINDOW_MILLIS: u64 = 25_000;
+
 /// How many device steps one update may take. A full run is four.
 const MAX_DEVICE_STEPS: usize = 16;
 
@@ -85,6 +93,7 @@ static mut RECV_BUF: [u8; MAX_RESPONSE_SIZE] = [0; MAX_RESPONSE_SIZE];
 type Fd = FdIpcClient<AsyncChannelTransport<IpcHandle>>;
 type Core = openprot_orchestrator_sm::Orchestrator<N, E>;
 type Driver = openprot_orchestrator_driver::PlatformDriver<UpdateBoard, N>;
+type Watchdogs = BootWatchdogs<N>;
 
 /// The device table. One checkpoint: the device reports ready inside the
 /// window or it does not.
@@ -133,13 +142,18 @@ enum Outcome {
     /// The device took the update but never came back from the reset that
     /// was supposed to boot it.
     SecondBootFailed,
+    /// The device booted the new image but nothing confirmed it, so the
+    /// commit window expired and the platform locked.
+    LockedOnExpiredCommit,
+    /// The commit window expired and the machine did not lock.
+    CommitWindowFailed,
 }
 
 /// Whether the run did what this scenario asked of it.
 fn verdict(outcome: Outcome) -> bool {
     match outcome {
         Outcome::Committed => {
-            if cfg!(any(device_hangs, device_stays_down)) {
+            if cfg!(any(device_hangs, device_stays_down, commit_times_out)) {
                 pw_log::error!("ORCH: the update committed, which this scenario rules out");
                 return false;
             }
@@ -164,6 +178,18 @@ fn verdict(outcome: Outcome) -> bool {
         }
         Outcome::UpdateFailed => {
             pw_log::error!("ORCH: the update did not go through");
+            false
+        }
+        Outcome::LockedOnExpiredCommit => {
+            if cfg!(commit_times_out) {
+                pw_log::info!("ORCH: nothing confirmed the boot, so the platform locked");
+                return true;
+            }
+            pw_log::error!("ORCH: the commit window expired");
+            false
+        }
+        Outcome::CommitWindowFailed => {
+            pw_log::error!("ORCH: the commit window expired and the machine did not lock");
             false
         }
     }
@@ -496,6 +522,14 @@ fn run(core: &mut Core, driver: &mut Driver, fd: &mut Fd) -> Outcome {
         return Outcome::UpdateFailed;
     }
 
+    // The activation proposed the image and opened the commit window: the
+    // floor waits for the device to prove it can run what it was given.
+    // The state machine names the bound as `CommitTimeout` and owns no
+    // clock, so this loop arms it, the way the orchestrator's run loop will
+    // have to.
+    let mut watchdogs = Watchdogs::new();
+    watchdogs.arm_commit(Duration::from_millis(COMMIT_WINDOW_MILLIS));
+
     // Activation only proposed the image. The state machine re-walks, and
     // that walk is what resets the device into what it just activated.
     let resets_after = RESETS.load(Ordering::Relaxed);
@@ -508,14 +542,54 @@ fn run(core: &mut Core, driver: &mut Driver, fd: &mut Fd) -> Outcome {
         return Outcome::SecondBootFailed;
     }
 
+    // The walk is green and the device is running the new image. What
+    // happens next is whether anything says so.
+    if cfg!(commit_times_out) {
+        return expire_commit(core, driver, &mut watchdogs);
+    }
+
     // Only now has the image proved it can run.
     core.dispatch(driver, Event::BootConfirmed(TARGET));
+    watchdogs.cancel_commit();
     if core.state() != State::Ready {
         pw_log::error!("ORCH: the machine did not settle after the second boot");
         return Outcome::SecondBootFailed;
     }
     pw_log::info!("ORCH: update committed after the device booted it");
     Outcome::Committed
+}
+
+/// Waits out the commit window with the confirmation withheld, and reports
+/// what the machine did about it.
+///
+/// Reached only when the second walk is already green, so the one thing
+/// missing is the confirmation. The window opened at the activation and
+/// nothing closed it: the state machine locks rather than commit an
+/// unproven image or leave the downgrade window open.
+fn expire_commit(core: &mut Core, driver: &mut Driver, watchdogs: &mut Watchdogs) -> Outcome {
+    loop {
+        match watchdogs.poll_expired() {
+            Some(Event::CommitTimeout) => {
+                core.dispatch(driver, Event::CommitTimeout);
+                break;
+            }
+            Some(_) => {
+                pw_log::error!("ORCH: a boot watchdog fired, and none was armed");
+                return Outcome::CommitWindowFailed;
+            }
+            // Nothing else can wake this: the walk is done and the device
+            // has nothing left to report.
+            None => {
+                let _ =
+                    syscall::object_wait(handle::WG, Signals::READABLE, watchdogs.wait_deadline());
+            }
+        }
+    }
+    if core.state() != State::Locked {
+        pw_log::error!("ORCH: the commit window expired and the platform did not lock");
+        return Outcome::CommitWindowFailed;
+    }
+    Outcome::LockedOnExpiredCommit
 }
 
 /// Waits for the managed device's walk to complete.
