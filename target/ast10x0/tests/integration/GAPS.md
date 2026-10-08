@@ -36,10 +36,10 @@ demo is measured by. It is docs only and still open, so this is a
 comparison and not yet a list of defects.
 
 Covered by `full_update`: the RoT boots first and holds the device in
-reset, releases it, supervises the walk, takes a Type 5 update through
-inventory, request, pass-component, update-component, the data loop,
-transfer, verify and apply, authenticates the new blob, resets the device,
-and sees it boot what it was given.
+reset, releases it, supervises the walk, discovers the terminus over Type 0,
+takes a Type 5 update through inventory, request, pass-component,
+update-component, the data loop, transfer, verify and apply, authenticates
+the new blob, resets the device, and sees it boot what it was given.
 
 Not covered, in the order they would have to be decided:
 
@@ -54,10 +54,6 @@ Not covered, in the order they would have to be decided:
 - The pending-reset handshake: a pending reset signal to the device, the
   device preparing for shutdown, and an acknowledgement. This exists
   nowhere, not in DSP0267, not in pldm-lib, not in the orchestrator.
-- Type 0 terminus discovery: GetPLDMTypes, GetPLDMVersion above 1.2, and
-  GetPLDMCommands covering inventory and update. The device answers these
-  already, through the control context in pldm-lib, so this is an addition
-  to the agent in the test.
 - Authenticating the running image before the first release. The verifier
   reads nothing and the device table carries no layout, so the first boot
   is unverified. Doing it for real means two processes mapping the FMC,
