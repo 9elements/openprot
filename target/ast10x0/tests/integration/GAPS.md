@@ -81,11 +81,11 @@ Not covered, in the order they would have to be decided:
 ## What the commit-timeout scenario does not say
 
 `full_update/commit_times_out` arms the commit watchdog from the scenario's
-own run loop, through the shipped `BootWatchdogs`. Nothing in the shipped
-image arms it: `arm_commit` has no caller outside tests, so the commit-or-lock
-bound the state machine promises is not wired anywhere yet. The scenario
-proves the state machine and the timer against the kernel clock with a real
-activation ahead of them, not that the shipped orchestrator would lock.
+own run loop, through the shipped `BootWatchdogs::follow_commit`. There is no
+orchestrator application yet, so this run loop is the only caller: the
+scenario proves the state machine, the helper and the timer against the
+kernel clock with a real activation ahead of them, not that a shipped
+orchestrator would lock.
 
 `tests/orchestrator/runtime` scenario 6 already covers the timer in
 isolation, with no update in flight. What this adds is the window opened by

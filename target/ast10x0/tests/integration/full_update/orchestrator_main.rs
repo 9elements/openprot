@@ -77,7 +77,7 @@ const DEVICE_TIMEOUT_MILLIS: u64 = 10_000;
 /// judged by its walk and not by this. The scenario that waits the window
 /// out uses the same one: guest time under QEMU runs far ahead of the
 /// host, so 25 seconds of it costs about a second of test.
-const COMMIT_WINDOW_MILLIS: u64 = 25_000;
+const COMMIT_WINDOW: Duration = Duration::from_millis(25_000);
 
 /// How many device steps one update may take. A full run is four.
 const MAX_DEVICE_STEPS: usize = 16;
@@ -522,13 +522,12 @@ fn run(core: &mut Core, driver: &mut Driver, fd: &mut Fd) -> Outcome {
         return Outcome::UpdateFailed;
     }
 
-    // The activation proposed the image and opened the commit window: the
-    // floor waits for the device to prove it can run what it was given.
-    // The state machine names the bound as `CommitTimeout` and owns no
-    // clock, so this loop arms it, the way the orchestrator's run loop will
-    // have to.
+    // The activation opened the commit window: the floor waits for the
+    // device to prove it can run what it was given. The state machine
+    // bounds the window with `CommitTimeout` and owns no clock, so the loop
+    // follows it after each dispatch and the watchdog arms itself.
     let mut watchdogs = Watchdogs::new();
-    watchdogs.arm_commit(Duration::from_millis(COMMIT_WINDOW_MILLIS));
+    watchdogs.follow_commit(core.pending_commit(), COMMIT_WINDOW);
 
     // Activation only proposed the image. The state machine re-walks, and
     // that walk is what resets the device into what it just activated.
@@ -550,7 +549,7 @@ fn run(core: &mut Core, driver: &mut Driver, fd: &mut Fd) -> Outcome {
 
     // Only now has the image proved it can run.
     core.dispatch(driver, Event::BootConfirmed(TARGET));
-    watchdogs.cancel_commit();
+    watchdogs.follow_commit(core.pending_commit(), COMMIT_WINDOW);
     if core.state() != State::Ready {
         pw_log::error!("ORCH: the machine did not settle after the second boot");
         return Outcome::SecondBootFailed;
