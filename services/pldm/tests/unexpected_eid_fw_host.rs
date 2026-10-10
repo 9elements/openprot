@@ -12,15 +12,25 @@ use openprot_mctp_server::Server;
 use openprot_pldm_service::firmware_device::{FirmwareDevice, RunTerminusResult};
 use openprot_pldm_service::{MctpPldmTransport, PldmServiceError};
 use pldm_common::codec::PldmCodec;
+use pldm_common::message::firmware_update::activate_pending_component::{
+    PendingComponent, PendingComponentResult,
+};
 use pldm_common::message::firmware_update::apply_complete::ApplyResult;
 use pldm_common::message::firmware_update::get_fw_params::FirmwareParameters;
 use pldm_common::message::firmware_update::get_status::{
     GetStatusRequest, GetStatusResponse, ProgressPercent,
 };
+use pldm_common::message::firmware_update::request_cancel::{
+    NonFunctioningComponentBitmap, NonFunctioningComponentIndication,
+};
 use pldm_common::message::firmware_update::request_update::RequestUpdateRequest;
 use pldm_common::message::firmware_update::transfer_complete::TransferResult;
+use pldm_common::message::firmware_update::update_security_revision::{
+    SecurityRevisionComponent, SecurityRevisionResult,
+};
 use pldm_common::message::firmware_update::verify_complete::VerifyResult;
 use pldm_common::protocol::base::{PldmBaseCompletionCode, PldmMsgType};
+use pldm_common::protocol::firmware_update::PldmFdTime;
 use pldm_common::protocol::firmware_update::{
     ComponentResponseCode, Descriptor, FirmwareDeviceState,
 };
@@ -138,6 +148,47 @@ impl FdOps for MockFdOps {
 
     fn cancel_update_component(&self, _component: &FirmwareComponent) -> Result<(), FdOpsError> {
         Ok(())
+    }
+    /// Nothing in this test activates a pending image.
+    fn handle_pending_component(
+        &self,
+        _component: &PendingComponent,
+        _fw_params: &FirmwareParameters,
+    ) -> Result<PendingComponentResult, FdOpsError> {
+        Ok(PendingComponentResult::NotPermitted)
+    }
+
+    /// No component goes non-functional when this device leaves update mode.
+    fn get_non_functional_component_info(
+        &self,
+    ) -> Result<
+        (
+            NonFunctioningComponentIndication,
+            NonFunctioningComponentBitmap,
+        ),
+        FdOpsError,
+    > {
+        Ok((
+            NonFunctioningComponentIndication::ComponentsFunctioning,
+            NonFunctioningComponentBitmap::new(0),
+        ))
+    }
+
+    /// This device does not commit security revisions.
+    fn update_security_revision(
+        &self,
+        _component: &SecurityRevisionComponent,
+        _fw_params: &FirmwareParameters,
+    ) -> Result<SecurityRevisionResult, FdOpsError> {
+        Ok(SecurityRevisionResult::NotPermitted)
+    }
+
+    /// Host test: the wall clock is monotonic enough for the FD timers.
+    fn now(&self) -> PldmFdTime {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as PldmFdTime)
+            .unwrap_or(0)
     }
 }
 
