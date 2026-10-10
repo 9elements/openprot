@@ -37,6 +37,7 @@ SCENARIO_CFGS = [
     "transfer_error",
     "cancel_mid_transfer",
     "offer_before_supervising",
+    "svn_commit",
 ]
 
 KERNEL_DEPS = [

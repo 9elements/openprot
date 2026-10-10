@@ -69,8 +69,10 @@ abort would do is untested.
 
 ## Arcs of the update state machine with no scenario
 
-- `UpdateSecurityRevision` and the `SvnCommitPending` status, so
-  `commit_self_svn_floor` has no path that reaches it.
+- The eRoT's own floor after a self-update. `commit_self_svn_floor` has no
+  path that reaches it. `pldm_update/svn_commit` covers the downstream
+  half, but `SelfUpdate` is not on `BoardCapabilities` and the eRoT cannot
+  be an update target, so there is nothing to drive.
 - Commit timeout, and the commit-or-lock latch that bounds the
   activated-but-not-committed window.
 - Recovery preempting an update: `Updating` to `Recovering`, with the
