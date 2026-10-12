@@ -49,7 +49,8 @@ pub enum FdStatus {
     /// FD has an offer the orchestrator has not yet accepted or
     /// rejected. `target` is the PLDM component identifier, `total`
     /// is the image size in bytes. `svn_delayed` is true when the UA
-    /// requested delayed SVN update (DSP0267 bit 9).
+    /// requested delayed SVN update, `UpdateOptionFlags` bit 2 in
+    /// DSP0267 1.3.0.
     OfferPending {
         target: u16,
         total: u32,
