@@ -30,8 +30,9 @@ use openprot_orchestrator_driver::{
 };
 use openprot_orchestrator_sm::{ComponentAttrs, ComponentId, Event, PowerOnResult, State};
 use orchestrator_capabilities::{
-    AuthenticatedImage, BootControl, BootStatus, EvidenceReader, IncrementalVerifier, PollOutcome,
-    StageProgress, Svn, SvnFloor, Updatable, UpdateError, VerifySession,
+    AuthenticatedImage, BootControl, BootStatus, DeviceTrialBoot, EvidenceReader,
+    IncrementalVerifier, PollOutcome, StageProgress, Svn, SvnFloor, Updatable, UpdateError,
+    VerifySession,
 };
 use orchestrator_checkpoint_walk::CheckpointWalk;
 use orchestrator_config::{
@@ -145,6 +146,72 @@ enum Outcome {
     SecondBootFailed,
 }
 
+/// The managed device's trial record, counting what the orchestrator did
+/// with it. The record itself is inside the board, which the driver takes
+/// and hands no reference to.
+static CONFIRMS: AtomicU32 = AtomicU32::new(0);
+static REVERTS: AtomicU32 = AtomicU32::new(0);
+
+/// The device's trial record. A real one is slot metadata the device reads
+/// at boot; this one counts, because what the scenario claims is that the
+/// orchestrator closed the trial the right way.
+struct TrialRecord;
+
+impl DeviceTrialBoot for TrialRecord {
+    type Error = BoardFault;
+
+    /// Never read: nothing settles a device's open trial at boot yet, which
+    /// is the question on the gaps tab. A record that answers "nothing
+    /// pending" is the honest answer for a scenario that starts clean.
+    fn is_pending(&self) -> Result<bool, BoardFault> {
+        Ok(false)
+    }
+
+    fn confirm(&mut self) -> Result<(), BoardFault> {
+        CONFIRMS.fetch_add(1, Ordering::Relaxed);
+        pw_log::info!("ORCH: the device's trial was confirmed");
+        Ok(())
+    }
+
+    fn revert(&mut self) -> Result<(), BoardFault> {
+        REVERTS.fetch_add(1, Ordering::Relaxed);
+        pw_log::info!("ORCH: the device's trial was reverted");
+        Ok(())
+    }
+}
+
+/// What each scenario expects the orchestrator to have done with the
+/// device's trial: confirms, then reverts.
+const EXPECT_TRIAL: (u32, u32) = if cfg!(device_hangs) {
+    // No update is ever offered, so no image is ever on trial.
+    (0, 0)
+} else if cfg!(device_stays_down) {
+    // The image was activated and never ran, so it is thrown away.
+    (0, 1)
+} else {
+    // The device booted what it was given, which is what confirms it.
+    (1, 0)
+};
+
+/// Whether the trial ended the way this scenario says it must.
+fn trial_closed_as_expected() -> bool {
+    let closed = (
+        CONFIRMS.load(Ordering::Relaxed),
+        REVERTS.load(Ordering::Relaxed),
+    );
+    if closed == EXPECT_TRIAL {
+        return true;
+    }
+    pw_log::error!(
+        "ORCH: the device's trial closed {} confirms and {} reverts, expected {} and {}",
+        closed.0 as u32,
+        closed.1 as u32,
+        EXPECT_TRIAL.0 as u32,
+        EXPECT_TRIAL.1 as u32
+    );
+    false
+}
+
 /// Whether the run did what this scenario asked of it.
 fn verdict(outcome: Outcome) -> bool {
     match outcome {
@@ -154,12 +221,12 @@ fn verdict(outcome: Outcome) -> bool {
                 return false;
             }
             pw_log::info!("ORCH: the device booted the image it was given");
-            true
+            trial_closed_as_expected()
         }
         Outcome::FirstBootFailed => {
             if cfg!(device_hangs) {
                 pw_log::info!("ORCH: the device never came up, so no update was offered");
-                return true;
+                return trial_closed_as_expected();
             }
             pw_log::error!("ORCH: the device never came up");
             false
@@ -167,7 +234,7 @@ fn verdict(outcome: Outcome) -> bool {
         Outcome::SecondBootFailed => {
             if cfg!(device_stays_down) {
                 pw_log::info!("ORCH: the device took the update and never came back");
-                return true;
+                return trial_closed_as_expected();
             }
             pw_log::error!("ORCH: the device never came back from the activation reset");
             false
@@ -379,6 +446,7 @@ impl BoardCapabilities for UpdateBoard {
     type ReportSink = LogSink;
     type Updatable = FdUpdatable;
     type Recovery = ();
+    type DeviceTrial = TrialRecord;
     type Staging = PatternStaging;
     type UpdateVerifier = PatternVerifier;
     type SelfUpdate = ();
@@ -402,6 +470,7 @@ fn board() -> Board<UpdateBoard, N> {
             svn_floor: SvnFloorBinding::SelfManaged,
             updatable: FdUpdatable,
             recovery: (),
+            trial: TrialRecord,
         }),
         verifier: StubVerifier,
         report_sink: LogSink,

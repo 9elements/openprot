@@ -93,6 +93,17 @@ abort would do is untested.
 - The spare slot re-sync after a commit, and the floor advance held until
   the spare has the image.
 
+## Arcs the trial gate does not cover
+
+`DeviceTrialBoot` is wired and `full_update` closes a device's trial both
+ways: confirmed when the device boots what it was given, reverted when it
+takes the update and never comes back. What no scenario reaches is
+`is_pending`, which exists for an orchestrator that rebooted mid-update and
+has to read a device's open trial from stored state. Nothing calls it, so a
+trial left open by a crashed orchestrator is not settled at the next boot.
+That is the downstream twin of the eRoT's unclaimed-trial question, and it
+is undecided the same way.
+
 ## Assertions that are looser than they look
 
 `pldm_update` has no managed device, so its `BootConfirmed` is a

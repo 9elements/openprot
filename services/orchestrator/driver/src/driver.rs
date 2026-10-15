@@ -16,8 +16,9 @@ use crate::board::{
     Verdict, Verifier,
 };
 use orchestrator_capabilities::{
-    BootControl, BootWatch, FailureCause, IncrementalVerifier, Progress, Recovery, RestoreOutcome,
-    RunningImage, SelfUpdate, SelfUpdateState, Svn, SvnFloor, TrialOutcome, WalkVerdict,
+    BootControl, BootWatch, DeviceTrialBoot, FailureCause, IncrementalVerifier, Progress, Recovery,
+    RestoreOutcome, RunningImage, SelfUpdate, SelfUpdateState, Svn, SvnFloor, TrialOutcome,
+    WalkVerdict,
 };
 
 /// Why the driver could not carry out an effect.
@@ -67,6 +68,9 @@ pub enum DriverError {
     NoSelfImage,
     /// The eRoT's own update session could not be written.
     SelfUpdateFault,
+    /// A managed device's trial record could not be closed, so the device
+    /// still holds an image nothing has vouched for.
+    TrialFault,
     /// A staging step ran before anything commanded the work. Updates
     /// get the flag from `AuthenticateStageUpdate`, and a slot re-sync
     /// sets it when it queues the job. So the phase and the flag
@@ -93,6 +97,7 @@ impl core::fmt::Display for DriverError {
             DriverError::CandidateNotAuthenticated => "candidate has not passed verification yet",
             DriverError::NoSelfImage => "board wired no self-image",
             DriverError::SelfUpdateFault => "self-update session could not be written",
+            DriverError::TrialFault => "device trial record could not be closed",
             DriverError::UpdateNotCommanded => "staging ran before the SM commanded it",
         })
     }
@@ -605,6 +610,30 @@ impl<B: BoardCapabilities, const N: usize> PlatformDriver<B, N> {
             .map_err(|_| DriverError::SelfUpdateFault)
     }
 
+    /// Closes `id`'s trial, keeping the image it booted or throwing it away.
+    ///
+    /// One method for both because the two differ by a single call: the
+    /// decision is the machine's, and a driver that could confirm where the
+    /// machine said revert would be a worse seam than a bool.
+    ///
+    /// A failure here is an actuation fault and latches the machine, which
+    /// is the fail-secure reading: a trial that will not close leaves the
+    /// device holding an image nothing vouched for.
+    fn close_device_trial(&mut self, id: ComponentId, keep: bool) -> Result<(), DriverError> {
+        let trial = self
+            .board
+            .components
+            .get_mut(id.get() as usize)
+            .map(|component| &mut component.trial)
+            .ok_or(DriverError::UnknownComponent)?;
+        let outcome = if keep {
+            trial.confirm()
+        } else {
+            trial.revert()
+        };
+        outcome.map_err(|_| DriverError::TrialFault)
+    }
+
     /// Hands one report to the board's sink. Cannot fail, so reporting stays
     /// off the fail-secure path; reports arrive in the order the SM emitted
     /// them.
@@ -758,6 +787,8 @@ impl<B: BoardCapabilities, const N: usize> Platform for PlatformDriver<B, N> {
             Effect::ActivateUpdate => self.activate_update().map(|_| None),
             Effect::DiscardStaged => self.discard_staged().map(|_| None),
             Effect::ConfirmSelfTrial => self.confirm_self_trial().map(|_| None),
+            Effect::ConfirmDeviceTrial(id) => self.close_device_trial(id, true).map(|_| None),
+            Effect::RevertDeviceTrial(id) => self.close_device_trial(id, false).map(|_| None),
             // No board capability is composed for these seams yet, so they
             // fail secure here instead of behind stub methods.
             Effect::SignAttestation | Effect::LatchLockdown => return Err(EffectError),

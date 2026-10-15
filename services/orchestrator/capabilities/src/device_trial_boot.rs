@@ -112,6 +112,29 @@ pub trait DeviceTrialBoot {
     fn revert(&mut self) -> Result<(), Self::Error>;
 }
 
+/// Keeps no trial record, for a device that keeps its own.
+///
+/// The usual case under `SvnFloorBinding::SelfManaged`: the eRoT moves no
+/// slot metadata for that device, so there is nothing to confirm and
+/// nothing to revert, and `is_pending` answers that no trial of the eRoT's
+/// is open. A device whose slots the eRoT does keep wires a real one, or
+/// the orchestrator would activate an image and never close its trial.
+impl DeviceTrialBoot for () {
+    type Error = core::convert::Infallible;
+
+    fn is_pending(&self) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    fn confirm(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn revert(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -458,6 +458,24 @@ pub enum Effect {
     /// names a component, which this one cannot: the eRoT's floor is held in
     /// the board's self-image, not in the per-component array.
     ConfirmSelfTrial,
+    /// Keep the image a managed device booted: close its trial and make the
+    /// activated slot the confirmed one.
+    ///
+    /// The downstream counterpart of [`ConfirmSelfTrial`](Self::ConfirmSelfTrial),
+    /// emitted where a device's boot proves the image it was given. It moves
+    /// slot metadata and nothing else; the anti-rollback floor follows later
+    /// on [`CommitSvnFloor`](Self::CommitSvnFloor), so a revert always has an
+    /// image to go back to.
+    ConfirmDeviceTrial(ComponentId),
+    /// Throw away the image a managed device was given: close its trial
+    /// without keeping it, leaving the confirmed slot as it was.
+    ///
+    /// Emitted wherever an activated-but-uncommitted image loses its claim
+    /// without having proved itself: a newer update supersedes it, or
+    /// recovery puts the running image under suspicion. Also disarms, so the
+    /// next boot runs the confirmed slot even if the trial image never
+    /// booted.
+    RevertDeviceTrial(ComponentId),
     /// Recover `id` from its configured recovery source. The mechanism —
     /// golden image, A/B slot, streamed image, or vendor-specific scheme — is
     /// deferred to the [`Platform`](crate::Platform) driver, which resolves it

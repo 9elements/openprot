@@ -10,7 +10,9 @@ use orchestrator_config::DeviceConfig;
 use util_io::ByteSource;
 
 pub use orchestrator_capabilities::{AuthenticatedImage, BootControl, BootWatch, Measurement};
-use orchestrator_capabilities::{IncrementalVerifier, Recovery, SelfUpdate, SvnFloor};
+use orchestrator_capabilities::{
+    DeviceTrialBoot, IncrementalVerifier, Recovery, SelfUpdate, SvnFloor,
+};
 
 /// Access to one component's active firmware image, however it is reached —
 /// interposed flash, a PLDM/MCTP transfer, a RAM copy in tests.
@@ -219,6 +221,13 @@ pub trait BoardCapabilities {
     /// `()` for a board with no recovery path: every attempt reports
     /// source exhaustion immediately.
     type Recovery: Recovery;
+    /// Keeps or discards an activated-but-uncommitted image once its boot
+    /// has been judged. `()` for a device that keeps its own trial record,
+    /// the usual case under
+    /// [`SvnFloorBinding::SelfManaged`](crate::SvnFloorBinding::SelfManaged):
+    /// the eRoT moves no slot metadata there, so confirm and revert have
+    /// nothing to do.
+    type DeviceTrial: DeviceTrialBoot;
     /// The region an update source writes a candidate into. One region,
     /// because one update runs at a time.
     type Staging: ByteSource;
@@ -288,6 +297,9 @@ pub struct ComponentWiring<B: BoardCapabilities> {
     /// Stages updates for the component. A device with no update path
     /// wires an adapter whose `poll_stage` errors.
     pub updatable: B::Updatable,
+    /// The component's trial record: what a proven boot confirms and a
+    /// superseded or suspect image reverts.
+    pub trial: B::DeviceTrial,
     /// Restores the component's image from its configured sources. `()`
     /// for a board with no recovery path.
     pub recovery: B::Recovery,
@@ -310,6 +322,7 @@ pub struct ComponentWiring<B: BoardCapabilities> {
 ///     type ReportSink = MctpReports;      // reports out over the management transport
 ///     type Updatable = PldmDevice;        // device pulls its own chunks
 ///     type Recovery = SlotRecovery;       // A/B + golden, attempt-indexed
+///     type DeviceTrial = SlotTrial;       // confirm or revert the activated slot
 ///     type Staging = StagingFlash;        // where the update source writes
 ///     type UpdateVerifier = CryptoVerifier; // incremental signature check
 ///     type SelfUpdate = SelfUpdateSession; // session record in the eRoT's own flash

@@ -338,6 +338,7 @@ impl BoardCapabilities for UpdateBoard {
     type ReportSink = LogSink;
     type Updatable = FdUpdatable;
     type Recovery = ();
+    type DeviceTrial = ();
     type Staging = PatternStaging;
     type UpdateVerifier = PatternVerifier;
     type SelfUpdate = ();
@@ -361,6 +362,7 @@ fn board() -> Board<UpdateBoard, N> {
             svn_floor: SvnFloorBinding::SelfManaged,
             updatable: FdUpdatable,
             recovery: (),
+            trial: (),
         }),
         verifier: StubVerifier,
         report_sink: LogSink,

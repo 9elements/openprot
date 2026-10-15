@@ -48,6 +48,18 @@ pub(crate) enum Outcome {
 /// A cascade can land in `Ready` instead, when nothing ungated is left to walk,
 /// and `Ready` entry emits one effect of its own (`ConfirmSelfTrial`). That
 /// comes to `2 * N + 1`, one under the same bound.
+///
+/// The trial gate adds emissions in three places and none of them raises the
+/// worst case. `ConfirmDeviceTrial` is emitted from `Ready`'s `BootConfirmed`
+/// arm, which handles in place and cannot coincide with a cascade: one event
+/// is either a boot confirmation or a corruption, never both.
+/// `RevertDeviceTrial` is emitted from `Updating` and `Recovering` entry,
+/// taking each to two effects. `Updating` is reached from `Ready` on
+/// `UpdateRequest`, whose handler emits nothing. `Recovering` is reached
+/// where `gate_by_policy` answers `NotGated`, which is the arm that emits
+/// nothing either, so a cascade and a `Recovering` entry never land in one
+/// `Sink`. Two effects is therefore the whole batch on those paths, well
+/// under the bound.
 /// `Rot::new` refuses to compile unless `E >= 2 * N + 2`, so a machine that
 /// builds can never overflow this buffer.
 pub struct Sink<const E: usize> {

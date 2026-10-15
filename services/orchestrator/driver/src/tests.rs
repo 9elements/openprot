@@ -889,6 +889,7 @@ impl BoardCapabilities for MockBoard {
     type ReportSink = RecordingSink;
     type Updatable = MockUpdatable;
     type Recovery = ();
+    type DeviceTrial = ();
     type Staging = MemStaging;
     type UpdateVerifier = StubVerifier;
     type SelfUpdate = MockSelfUpdate;
@@ -922,6 +923,7 @@ fn mock_component(index: usize) -> ComponentWiring<MockBoard> {
         svn_floor: SvnFloorBinding::Erot(MockFloor::new()),
         updatable: MockUpdatable::new(),
         recovery: (),
+        trial: (),
     }
 }
 
@@ -1262,6 +1264,7 @@ impl BoardCapabilities for WatchBoard {
     type ReportSink = ();
     type Updatable = MockUpdatable;
     type Recovery = ();
+    type DeviceTrial = ();
     type Staging = MemStaging;
     type UpdateVerifier = StubVerifier;
     type SelfUpdate = MockSelfUpdate;
@@ -1287,6 +1290,7 @@ fn release_follows_verification() {
                 svn_floor: SvnFloorBinding::Erot(MockFloor::new()),
                 updatable: MockUpdatable::new(),
                 recovery: (),
+                trial: (),
             }],
             verifier: LineWatchingVerifier {
                 inner: XorVerifier::accepting(),
@@ -1676,6 +1680,7 @@ impl BoardCapabilities for RecoverableBoard {
     type ReportSink = RecordingSink;
     type Updatable = MockUpdatable;
     type Recovery = MockRecovery;
+    type DeviceTrial = ();
     type Staging = MemStaging;
     type UpdateVerifier = StubVerifier;
     type SelfUpdate = MockSelfUpdate;
@@ -1696,6 +1701,7 @@ fn recoverable_component(sources: u8, index: usize) -> ComponentWiring<Recoverab
             sources,
             fail_on: None,
         },
+        trial: (),
     }
 }
 
