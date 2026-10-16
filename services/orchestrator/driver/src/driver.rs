@@ -16,9 +16,9 @@ use crate::board::{
     Verdict, Verifier,
 };
 use orchestrator_capabilities::{
-    BootControl, BootWatch, DeviceTrialBoot, FailureCause, IncrementalVerifier, Progress, Recovery,
-    RestoreOutcome, RunningImage, SelfUpdate, SelfUpdateState, Svn, SvnFloor, TrialOutcome,
-    WalkVerdict,
+    BootControl, BootWatch, DeviceTrialBoot, FailureCause, IncrementalVerifier, LockdownLatch,
+    Progress, Recovery, RestoreOutcome, RunningImage, SelfUpdate, SelfUpdateState, Svn, SvnFloor,
+    TrialOutcome, WalkVerdict,
 };
 
 /// Why the driver could not carry out an effect.
@@ -71,6 +71,9 @@ pub enum DriverError {
     /// A managed device's trial record could not be closed, so the device
     /// still holds an image nothing has vouched for.
     TrialFault,
+    /// The platform's terminal safe state could not be engaged, so the
+    /// machine is locked and the hardware is not.
+    LatchFault,
     /// A staging step ran before anything commanded the work. Updates
     /// get the flag from `AuthenticateStageUpdate`, and a slot re-sync
     /// sets it when it queues the job. So the phase and the flag
@@ -98,6 +101,7 @@ impl core::fmt::Display for DriverError {
             DriverError::NoSelfImage => "board wired no self-image",
             DriverError::SelfUpdateFault => "self-update session could not be written",
             DriverError::TrialFault => "device trial record could not be closed",
+            DriverError::LatchFault => "platform safe state could not be engaged",
             DriverError::UpdateNotCommanded => "staging ran before the SM commanded it",
         })
     }
@@ -610,6 +614,29 @@ impl<B: BoardCapabilities, const N: usize> PlatformDriver<B, N> {
             .map_err(|_| DriverError::SelfUpdateFault)
     }
 
+    /// Puts the platform into its terminal safe state.
+    ///
+    /// The machine has already decided; this is the actuation. `Ok` from
+    /// the board means the safe state is in force, so there is nothing
+    /// left for the driver to check.
+    ///
+    /// A failure reads as circular and is not. It answers `EffectError`,
+    /// which makes the orchestrator inject `Event::EffectFailed` at the
+    /// front of the queue, and that event arrives in `Locked`, which is
+    /// unsupervised and drops it: no transition, no entry action, no
+    /// second latch attempt. The orchestrator also injects `EffectFailed`
+    /// at most once per dispatch. So a failed latch leaves the machine
+    /// locked and the platform unheld, and nothing reports it. Making
+    /// that visible wants either a `Report` variant or a log dependency
+    /// this crate does not have, and it is recorded as a gap rather than
+    /// decided here.
+    fn latch_lockdown(&mut self) -> Result<(), DriverError> {
+        self.board
+            .lockdown
+            .latch()
+            .map_err(|_| DriverError::LatchFault)
+    }
+
     /// Closes `id`'s trial, keeping the image it booted or throwing it away.
     ///
     /// One method for both because the two differ by a single call: the
@@ -789,9 +816,10 @@ impl<B: BoardCapabilities, const N: usize> Platform for PlatformDriver<B, N> {
             Effect::ConfirmSelfTrial => self.confirm_self_trial().map(|_| None),
             Effect::ConfirmDeviceTrial(id) => self.close_device_trial(id, true).map(|_| None),
             Effect::RevertDeviceTrial(id) => self.close_device_trial(id, false).map(|_| None),
-            // No board capability is composed for these seams yet, so they
-            // fail secure here instead of behind stub methods.
-            Effect::SignAttestation | Effect::LatchLockdown => return Err(EffectError),
+            Effect::LatchLockdown => self.latch_lockdown().map(|_| None),
+            // No board capability is composed for this seam yet, so it
+            // fails secure here instead of behind a stub method.
+            Effect::SignAttestation => return Err(EffectError),
             // Emit is consumed by the orchestrator; receiving one is a
             // driver bug.
             Effect::Emit(_) => return Err(EffectError),

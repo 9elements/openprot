@@ -93,6 +93,29 @@ abort would do is untested.
 - The spare slot re-sync after a commit, and the floor advance held until
   the spare has the image.
 
+## What the lockdown latch does not prove
+
+`LockdownLatch` is wired and the scenarios count it: once where the run
+ends in lockdown, never in a run that comes up. What they do not exercise
+is a safe state. The mock counts; a real one on this board holds every
+managed device in reset and denies writes in the SPI monitor, and answers
+`Ok` only when both are in force. QEMU models one chip and there is no
+second device to hold, so the claim here is about the orchestrator, not
+the platform.
+
+A failed latch is invisible, which is narrower than it sounds and worth
+stating exactly. The attempt happens: `Locked` entry emits the effect and
+the driver calls the board once. What is lost is the failure. The driver
+answers `EffectError`, and the orchestrator injects `Event::EffectFailed`
+at most once per dispatch, so a run that reached `Locked` through an
+earlier failure has already spent that injection; where it has not, the
+event arrives in `Locked`, which is unsupervised and drops it. Either way
+there is no second attempt and no report, and the driver crate has no
+logger. So a board that cannot engage its safe state leaves the machine
+locked, the hardware unheld, and nothing saying so. Fixing that is a
+`Report` variant or a log dependency, and it is a decision rather than an
+oversight.
+
 ## Arcs the trial gate does not cover
 
 `DeviceTrialBoot` is wired and `full_update` closes a device's trial both

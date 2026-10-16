@@ -2082,6 +2082,26 @@ fn an_unrelated_boot_confirmed_leaves_the_commit_window_open() {
 }
 
 /// The other component's report must also leave the window usable: the
+/// Entering lockdown asks the board for its safe state, once. The effect
+/// is the only thing `Locked` entry emits, and nothing re-enters.
+#[test]
+fn entering_lockdown_emits_one_latch() {
+    let (effects, state) = drive(
+        chain(&[(C0, ComponentAttrs::passive_required())]),
+        &[Event::PowerGood(PowerOnResult::Unprovisioned)],
+    );
+
+    assert_eq!(state, State::Locked);
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|e| **e == Effect::LatchLockdown)
+            .count(),
+        1,
+        "the safe state is engaged once, on entry"
+    );
+}
+
 /// A proven boot closes the device's trial, and only the device's own.
 #[test]
 fn a_proven_boot_confirms_the_trial_of_the_component_that_booted() {

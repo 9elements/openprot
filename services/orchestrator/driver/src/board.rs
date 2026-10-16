@@ -11,7 +11,7 @@ use util_io::ByteSource;
 
 pub use orchestrator_capabilities::{AuthenticatedImage, BootControl, BootWatch, Measurement};
 use orchestrator_capabilities::{
-    DeviceTrialBoot, IncrementalVerifier, Recovery, SelfUpdate, SvnFloor,
+    DeviceTrialBoot, IncrementalVerifier, LockdownLatch, Recovery, SelfUpdate, SvnFloor,
 };
 
 /// Access to one component's active firmware image, however it is reached —
@@ -228,6 +228,22 @@ pub trait BoardCapabilities {
     /// the eRoT moves no slot metadata there, so confirm and revert have
     /// nothing to do.
     type DeviceTrial: DeviceTrialBoot;
+    /// Puts the platform into its terminal safe state when the machine
+    /// latches.
+    ///
+    /// Platform-wide, not per component: one latch, one safe state. What
+    /// the safe state is stays board wiring. On a board where the eRoT
+    /// sits in the flash path it is both halves of the same idea: hold
+    /// every managed device in reset, and deny writes in the SPI monitor
+    /// so a device held in reset is not simply written by another master
+    /// on the bus. `latch` answers `Ok` only once that is in force.
+    ///
+    /// No `()` default, unlike [`Recovery`] and
+    /// [`DeviceTrialBoot`](orchestrator_capabilities::DeviceTrialBoot).
+    /// "This device keeps its own trial record" and "this board has no
+    /// recovery source" are honest board properties; "this board has no
+    /// safe state" is a decision someone should have to write down.
+    type Lockdown: LockdownLatch;
     /// The region an update source writes a candidate into. One region,
     /// because one update runs at a time.
     type Staging: ByteSource;
@@ -323,6 +339,7 @@ pub struct ComponentWiring<B: BoardCapabilities> {
 ///     type Updatable = PldmDevice;        // device pulls its own chunks
 ///     type Recovery = SlotRecovery;       // A/B + golden, attempt-indexed
 ///     type DeviceTrial = SlotTrial;       // confirm or revert the activated slot
+///     type Lockdown = HoldAndDeny;        // every device in reset, SPI monitor denying
 ///     type Staging = StagingFlash;        // where the update source writes
 ///     type UpdateVerifier = CryptoVerifier; // incremental signature check
 ///     type SelfUpdate = SelfUpdateSession; // session record in the eRoT's own flash
@@ -381,6 +398,10 @@ pub struct Board<B: BoardCapabilities, const N: usize> {
     /// Where the driver hands the SM's reports. One per platform, not one
     /// per component: two of the four reports name no component.
     pub report_sink: B::ReportSink,
+    /// Puts the platform into its terminal safe state. Called once, on
+    /// entry to lockdown, and never unwound: only a platform reset
+    /// clears it.
+    pub lockdown: B::Lockdown,
     /// Where an update source leaves the candidate. Not per component:
     /// the SM allows one update at a time, so one region serves all of
     /// them.

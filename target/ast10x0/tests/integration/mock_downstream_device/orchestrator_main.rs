@@ -28,7 +28,7 @@
 use core::convert::Infallible;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
-use board_stubs::{BoardFault, StubImage, StubVerifier};
+use board_stubs::{BoardFault, CountingLatch, StubImage, StubVerifier};
 use openprot_orchestrator_driver::{
     bring_up, settle_self_image_at_boot, Board, BoardCapabilities, ComponentWiring, Report,
     ReportSink, SelfImage, SelfUpdateSettlement, SvnFloorBinding,
@@ -411,6 +411,7 @@ impl BoardCapabilities for MockDownstreamDeviceBoard {
     type Updatable = NoUpdate;
     type Recovery = ();
     type DeviceTrial = ();
+    type Lockdown = CountingLatch;
     type Staging = NoStaging;
     type UpdateVerifier = NeverVerifier;
     type SelfUpdate = SelfSession;
@@ -438,6 +439,7 @@ fn board() -> Board<MockDownstreamDeviceBoard, N> {
         }),
         verifier: StubVerifier,
         report_sink: LogSink,
+        lockdown: CountingLatch,
         update_staging: NoStaging,
         update_verifier: Some(NeverVerifier),
         self_image: Some(SelfImage {
@@ -458,6 +460,24 @@ fn drain_reports() {
             DEVICE_READY.store(true, Ordering::Relaxed);
         }
     }
+}
+
+/// Whether the platform's safe state was engaged as often as this build
+/// arranges: once where the run ends in lockdown, never anywhere else. A
+/// latch in a run that was supposed to come up is a failure nothing else
+/// here would catch.
+fn latched_as_expected() -> bool {
+    let expected = u32::from(EXPECT_LOCKDOWN);
+    let latches = board_stubs::latches();
+    if latches == expected {
+        return true;
+    }
+    pw_log::error!(
+        "the platform latched {} times, expected {}",
+        latches as u32,
+        expected as u32
+    );
+    false
 }
 
 fn run() -> Result<(), ()> {
@@ -504,6 +524,9 @@ fn run() -> Result<(), ()> {
     loop {
         if core.state() == State::Locked {
             if EXPECT_LOCKDOWN {
+                if !latched_as_expected() {
+                    return Err(());
+                }
                 pw_log::info!("the device never came up and the platform locked");
                 return Ok(());
             }
@@ -523,6 +546,9 @@ fn run() -> Result<(), ()> {
                 && SelfSession::read() != (SelfUpdateState::Committed { svn: TRIAL_SVN })
             {
                 pw_log::error!("the chain came up and the self trial was not confirmed");
+                return Err(());
+            }
+            if !latched_as_expected() {
                 return Err(());
             }
             pw_log::info!("device booted and the orchestrator is in Ready");
