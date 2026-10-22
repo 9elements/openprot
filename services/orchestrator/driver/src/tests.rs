@@ -3058,6 +3058,587 @@ fn commit_with_an_unreadable_session_fails_secure() {
 }
 
 // ---------------------------------------------------------------------------
+// The eRoT self-trial: settled at boot, confirmed when the chain is up
+// ---------------------------------------------------------------------------
+
+/// A one-component driver whose board keeps `session` as the eRoT's own
+/// update session.
+fn self_trial_driver(session: MockSelfUpdate) -> PlatformDriver<MockBoard, 1> {
+    PlatformDriver::new(
+        &passive_entries(),
+        Board {
+            self_update: Some(ErotUpdate {
+                session,
+                floor: MockFloor::new(),
+                reset: MockSelfReset::new(),
+            }),
+            ..mock_board()
+        },
+    )
+}
+
+/// The eRoT's own session in the state the test needs, with the trial
+/// image running.
+fn trial_session(state: SelfUpdateState) -> MockSelfUpdate {
+    MockSelfUpdate::with_session(state, RunningImage::Trial)
+}
+
+/// What the board's self-update session reads.
+fn session_state(driver: &PlatformDriver<MockBoard, 1>) -> SelfUpdateState {
+    driver
+        .board()
+        .self_update
+        .as_ref()
+        .expect("the test wired a self-update")
+        .session
+        .state
+}
+
+/// What the floor next to that session reads.
+fn self_floor(driver: &PlatformDriver<MockBoard, 1>) -> Svn {
+    driver
+        .board()
+        .self_update
+        .as_ref()
+        .expect("the test wired a self-update")
+        .floor
+        .floor()
+        .expect("the mock does not fault")
+}
+
+// The trial image booted and the chain came up behind it, so the machine
+// confirms the session on its way into Ready. The floor stays where it is:
+// advancing it is the update agent's to ask for.
+#[test]
+fn a_trial_that_reaches_ready_is_confirmed() {
+    let mut orch = orchestrator();
+    let mut driver =
+        self_trial_driver(trial_session(SelfUpdateState::TrialPending { svn: Svn(7) }));
+    let floor_before = self_floor(&driver);
+
+    orch.dispatch(&mut driver, Event::SelfTrialBooted);
+    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
+
+    assert_eq!(orch.state(), State::Ready);
+    assert_eq!(
+        session_state(&driver),
+        SelfUpdateState::Committed { svn: Svn(7) }
+    );
+    assert_eq!(
+        self_floor(&driver),
+        floor_before,
+        "confirming is not committing"
+    );
+}
+
+// An ordinary boot on the same board. Nothing said a trial was running, so
+// the session is left where it is.
+#[test]
+fn a_boot_with_no_trial_leaves_the_session_alone() {
+    let mut orch = orchestrator();
+    let mut driver = self_trial_driver(MockSelfUpdate::idle());
+
+    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
+
+    assert_eq!(orch.state(), State::Ready);
+    assert_eq!(session_state(&driver), SelfUpdateState::Idle);
+}
+
+// The event says the settle call produced it and the board has
+// none, so the
+// two disagree about whether this eRoT updates itself. The effect fails and
+// the platform locks down rather than carrying on with a trial nothing can
+// confirm.
+#[test]
+fn confirming_a_trial_with_no_self_update_locks_down() {
+    let mut orch = orchestrator();
+    let mut driver = driver([MemImage::holding(valid_image())]);
+
+    orch.dispatch(&mut driver, Event::SelfTrialBooted);
+    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
+
+    assert_eq!(orch.state(), State::Locked);
+}
+
+// The session write fails. Same fail-secure answer: the trial is not
+// confirmed and the platform locks down.
+#[test]
+fn a_session_that_cannot_be_written_locks_down() {
+    let mut orch = orchestrator();
+    let mut driver = self_trial_driver(MockSelfUpdate {
+        fail: true,
+        ..trial_session(SelfUpdateState::TrialPending { svn: Svn(7) })
+    });
+
+    orch.dispatch(&mut driver, Event::SelfTrialBooted);
+    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
+
+    assert_eq!(orch.state(), State::Locked);
+}
+
+// The boot that runs a trial image. The driver reads the board's own
+// session and names the event the state machine needs in order to judge
+// the trial.
+#[test]
+fn settling_a_running_trial_names_the_event_to_dispatch() {
+    let mut driver =
+        self_trial_driver(trial_session(SelfUpdateState::TrialPending { svn: Svn(7) }));
+
+    let settlement = driver
+        .settle_self_update_session()
+        .expect("the mock does not fault");
+
+    assert_eq!(
+        settlement,
+        SelfUpdateSettlement::TrialRunning { svn: Svn(7) }
+    );
+    assert_eq!(settlement.event(), Some(Event::SelfTrialBooted));
+    assert_eq!(
+        session_state(&driver),
+        SelfUpdateState::TrialPending { svn: Svn(7) },
+        "settling judges nothing"
+    );
+}
+
+// A board that never updates itself wires no self-update. There is no
+// session to settle and nothing to tell the machine.
+#[test]
+fn a_board_with_no_self_update_is_already_settled() {
+    let mut driver = driver([MemImage::holding(valid_image())]);
+
+    let settlement = driver
+        .settle_self_update_session()
+        .expect("nothing to read");
+
+    assert_eq!(settlement, SelfUpdateSettlement::Settled);
+    assert_eq!(settlement.event(), None);
+}
+
+// A confirmed session the floor has not taken yet. The advance is the
+// update agent's to ask for, and no trial is running, so the settlement
+// names no event.
+#[test]
+fn settling_an_awaited_floor_advance_names_no_event() {
+    let mut driver = self_trial_driver(trial_session(SelfUpdateState::Committed { svn: Svn(7) }));
+
+    let settlement = driver
+        .settle_self_update_session()
+        .expect("the mock does not fault");
+
+    assert_eq!(
+        settlement,
+        SelfUpdateSettlement::AwaitingFloorAdvance { svn: Svn(7) }
+    );
+    assert_eq!(settlement.event(), None);
+}
+
+// The session reads `Idle` while the trial image is still running. That is
+// what a revert leaves behind: it puts the slot metadata back but cannot
+// unrun the image, so the part keeps running what it booted until the next
+// reset. No trial is open, so the settlement names no event.
+#[test]
+fn settling_an_unclaimed_image_names_no_event() {
+    let mut driver = self_trial_driver(trial_session(SelfUpdateState::Idle));
+
+    let settlement = driver
+        .settle_self_update_session()
+        .expect("the mock does not fault");
+
+    assert_eq!(settlement, SelfUpdateSettlement::UnclaimedImageRunning);
+    assert_eq!(settlement.event(), None);
+}
+
+// The boot-time call: settling a running trial dispatches the event, so
+// the machine knows the trial is being judged before the walk starts.
+#[test]
+fn settling_at_boot_dispatches_the_trial_event() {
+    let mut orch = orchestrator();
+    let mut driver =
+        self_trial_driver(trial_session(SelfUpdateState::TrialPending { svn: Svn(7) }));
+
+    let settlement = settle_self_update_at_boot(&mut orch, &mut driver).expect("no fault");
+
+    assert_eq!(
+        settlement,
+        SelfUpdateSettlement::TrialRunning { svn: Svn(7) }
+    );
+    // The machine has not walked yet, so nothing is confirmed. The first
+    // `Ready` is what does that.
+    assert_eq!(
+        session_state(&driver),
+        SelfUpdateState::TrialPending { svn: Svn(7) }
+    );
+
+    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
+
+    assert_eq!(orch.state(), State::Ready);
+    assert_eq!(
+        session_state(&driver),
+        SelfUpdateState::Committed { svn: Svn(7) }
+    );
+}
+
+// Nothing was in flight, so no event reaches the state machine and the
+// boot walks as any other.
+#[test]
+fn settling_at_boot_with_no_session_dispatches_nothing() {
+    let mut orch = orchestrator();
+    let mut driver = self_trial_driver(MockSelfUpdate::idle());
+
+    let settlement = settle_self_update_at_boot(&mut orch, &mut driver).expect("no fault");
+
+    assert_eq!(settlement, SelfUpdateSettlement::Settled);
+
+    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
+
+    assert_eq!(orch.state(), State::Ready);
+    assert_eq!(session_state(&driver), SelfUpdateState::Idle);
+}
+
+// The session could not be read. The boot has no honest answer about the
+// last self-update, so nothing is dispatched and the fault is the
+// caller's to act on.
+#[test]
+fn settling_at_boot_passes_a_storage_fault_back() {
+    let mut orch = orchestrator();
+    let mut driver = self_trial_driver(MockSelfUpdate {
+        fail: true,
+        ..trial_session(SelfUpdateState::TrialPending { svn: Svn(7) })
+    });
+
+    assert!(settle_self_update_at_boot(&mut orch, &mut driver).is_err());
+
+    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
+
+    assert_eq!(
+        orch.state(),
+        State::Ready,
+        "no trial was declared, so the walk is an ordinary boot"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The eRoT self-update: activation, refusals and the SVN floor request
+// ---------------------------------------------------------------------------
+
+/// The eRoT at position 0, where `chain_of` puts it, and a passive device
+/// behind it. The eRoT alone never leaves `PreSupervision`, so driving the
+/// machine needs the device too.
+///
+/// The component kind decides which update path runs, in the state
+/// machine and in the driver alike. These tests build the two separately,
+/// so both take their chain from this helper and cannot disagree about
+/// which component is the eRoT.
+fn erot_chain() -> [(ComponentId, ComponentAttrs); EROT_N] {
+    entries_with_kinds([ComponentKind::Erot, ComponentKind::Passive])
+}
+
+/// Length of the eRoT chain: the eRoT and the one device behind it.
+const EROT_N: usize = 2;
+/// The effect buffer `Rot` requires for `EROT_N` components.
+const EROT_E: usize = 2 * EROT_N + 2;
+
+fn erot_orchestrator() -> Orchestrator<EROT_N, EROT_E> {
+    let chain = heapless::Vec::<_, EROT_N>::from_slice(&erot_chain()).expect("two fits");
+    Orchestrator::new(chain.try_into().unwrap(), MOCK_MAX_RETRY)
+}
+
+/// A driver over that chain with `session` as the eRoT's update session.
+fn erot_driver(session: MockSelfUpdate) -> PlatformDriver<MockBoard, EROT_N> {
+    erot_driver_with(session, StubVerifier::accepting())
+}
+
+fn erot_driver_with(
+    session: MockSelfUpdate,
+    update_verifier: StubVerifier,
+) -> PlatformDriver<MockBoard, EROT_N> {
+    PlatformDriver::new(
+        &erot_chain(),
+        Board {
+            self_update: Some(ErotUpdate {
+                session,
+                floor: MockFloor::new(),
+                reset: MockSelfReset::new(),
+            }),
+            update_verifier: Some(update_verifier),
+            ..mock_board()
+        },
+    )
+}
+
+/// Brings the state machine to `Ready`: the walk steps past the eRoT and
+/// the device behind it boots.
+fn erot_chain_up(
+    orch: &mut Orchestrator<EROT_N, EROT_E>,
+    driver: &mut PlatformDriver<MockBoard, EROT_N>,
+) {
+    orch.dispatch(driver, Event::PowerGood(PowerOnResult::Provisioned));
+    orch.dispatch(driver, Event::Booted(ComponentId::new(1)));
+    assert_eq!(orch.state(), State::Ready, "the chain is up");
+}
+
+/// Pumps the update until the verifier reaches a verdict:
+/// `UpdateVerified` for a candidate the eRoT may install,
+/// `UpdateRejected` for one it may not.
+fn pump_to_verdict<const N: usize>(driver: &mut PlatformDriver<MockBoard, N>) -> Event {
+    for tick in 0..16 {
+        if let Some(event) = driver.pump_update(tick).event {
+            return event;
+        }
+    }
+    panic!("the pump reached no verdict");
+}
+
+// `prepare` records the SVN before `set_trial_pending` marks the trial,
+// the order SelfUpdate states. A crash between the two leaves a pending
+// trial the next boot reads as unconfirmed; the other order would boot a
+// trial with no session to judge it.
+//
+// The SVN recorded is the candidate image's, the only one the eRoT ever
+// reads of itself. See "Where the SVN comes from" in
+// docs/src/design/erot-self-verification.md.
+#[test]
+fn activating_the_erots_own_update_records_the_session_then_reaches_the_reset() {
+    assert_ne!(
+        CANDIDATE_SVN, MOCK_SVN,
+        "the two SVN fixtures have to differ or this test proves nothing"
+    );
+    let mut driver = erot_driver(MockSelfUpdate::idle());
+    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
+    driver.prepare_update().unwrap();
+    assert_eq!(pump_to_verdict(&mut driver), Event::UpdateVerified);
+
+    assert_eq!(
+        driver.activate_update(),
+        Err(DriverError::SelfResetFault),
+        "the mock cannot reset the process it runs in"
+    );
+
+    let self_update = driver.board().self_update.as_ref().expect("wired above");
+    assert_eq!(
+        self_update.session.state(),
+        Ok(SelfUpdateState::TrialPending {
+            svn: Svn(CANDIDATE_SVN)
+        }),
+        "the session holds the candidate's own SVN, marked pending"
+    );
+    assert_eq!(self_update.reset.attempts, 1, "the reset was reached");
+}
+
+// The candidate for the eRoT authenticated with no manifest SVN, so there
+// is no session to record. The pump rejects it, the update ends and the
+// state machine returns to Ready. Rejecting at the activation would fail
+// that effect and lock the platform, which a missing version does not
+// warrant.
+#[test]
+fn a_versionless_self_candidate_ends_the_update_without_locking() {
+    let mut orch = erot_orchestrator();
+    let mut driver = erot_driver_with(MockSelfUpdate::idle(), StubVerifier::unversioned());
+    erot_chain_up(&mut orch, &mut driver);
+
+    request_update(&mut orch, &mut driver, C0, CANDIDATE_LEN).expect("the request is accepted");
+    assert_eq!(orch.state(), State::Updating(C0));
+
+    let verdict = pump_to_verdict(&mut driver);
+    assert_eq!(verdict, Event::UpdateRejected, "the pump rejected it");
+    assert!(driver
+        .board()
+        .report_sink
+        .seen
+        .contains(&Report::SelfImageNoSvn));
+
+    orch.dispatch(&mut driver, verdict);
+    assert_eq!(
+        orch.state(),
+        State::Ready,
+        "the update ended and the platform is not locked"
+    );
+    assert_eq!(driver.pending_update(), None, "and the job is gone");
+
+    let self_update = driver.board().self_update.as_ref().expect("wired above");
+    assert_eq!(
+        self_update.session.state(),
+        Ok(SelfUpdateState::Idle),
+        "nothing was recorded"
+    );
+    assert_eq!(self_update.reset.attempts, 0, "and nothing reset");
+}
+
+// One update at a time, whatever it targets. A request aimed at the eRoT
+// while a device behind it is being updated is refused as `UpdateBusy`,
+// and the job already in flight is untouched.
+//
+// The board wires no self-update either, so the self-update check would
+// refuse the request too. The answer is `UpdateBusy` and not
+// `NoErotUpdate` because the busy check in submit_update runs
+// first.
+#[test]
+fn an_erot_update_is_refused_while_a_device_update_is_in_flight() {
+    let mut driver = PlatformDriver::<MockBoard, EROT_N>::new(&erot_chain(), mock_board());
+    driver
+        .submit_update(C1, CANDIDATE_LEN)
+        .expect("the device update starts");
+
+    assert_eq!(
+        driver.submit_update(C0, CANDIDATE_LEN),
+        Err(DriverError::UpdateBusy)
+    );
+    assert_eq!(
+        driver.pending_update(),
+        Some(C1),
+        "the device update is still the one in flight"
+    );
+}
+
+// A board with no `ErotUpdate` cannot record the session the
+// update needs.
+// Accepting would run it to the activation, where the effect fails and
+// locks the platform. Refused at submit, the state machine never leaves
+// Ready.
+#[test]
+fn an_update_aimed_at_the_erot_is_refused_when_the_board_wires_no_self_update() {
+    let mut orch = erot_orchestrator();
+    let mut driver = PlatformDriver::<MockBoard, EROT_N>::new(&erot_chain(), mock_board());
+    erot_chain_up(&mut orch, &mut driver);
+
+    assert_eq!(
+        request_update(&mut orch, &mut driver, C0, CANDIDATE_LEN),
+        Err(DriverError::NoErotUpdate)
+    );
+    assert_eq!(orch.state(), State::Ready, "the request reached nothing");
+    assert_eq!(driver.pending_update(), None, "and stored nothing");
+}
+
+// A trial was confirmed but its SVN has not reached the floor. A second
+// update would overwrite the session holding it, and the floor would
+// never get it.
+#[test]
+fn a_second_self_update_is_refused_while_the_first_awaits_its_floor() {
+    let mut driver = erot_driver(MockSelfUpdate::with_session(
+        SelfUpdateState::Committed { svn: Svn(7) },
+        RunningImage::Confirmed,
+    ));
+
+    assert_eq!(
+        driver.submit_update(C0, CANDIDATE_LEN),
+        Err(DriverError::UpdateBusy)
+    );
+    assert_eq!(driver.pending_update(), None, "nothing was stored");
+    let self_update = driver.board().self_update.as_ref().expect("wired above");
+    assert_eq!(
+        self_update.session.state(),
+        Ok(SelfUpdateState::Committed { svn: Svn(7) }),
+        "and the session still holds the confirmed SVN"
+    );
+}
+
+// The same while the trial is being judged: this boot is the trial, and a
+// new record would overwrite the session that judges it.
+#[test]
+fn a_self_update_is_refused_while_the_trial_is_being_judged() {
+    let mut driver = erot_driver(trial_session(SelfUpdateState::TrialPending { svn: Svn(7) }));
+
+    assert_eq!(
+        driver.submit_update(C0, CANDIDATE_LEN),
+        Err(DriverError::UpdateBusy)
+    );
+}
+
+// A trial image that booted once and was not confirmed: the reset after
+// booted the old image again, so no boot that could confirm the trial
+// will come, and settlement drops the session either way. A new
+// self-update must not be refused for a session that can only be
+// discarded.
+#[test]
+fn a_self_update_may_start_over_a_trial_that_fell_back() {
+    let mut driver = erot_driver(MockSelfUpdate::with_session(
+        SelfUpdateState::TrialPending { svn: Svn(7) },
+        RunningImage::Confirmed,
+    ));
+
+    assert_eq!(driver.submit_update(C0, CANDIDATE_LEN), Ok(()));
+}
+
+/// The eRoT's own floor, as [`self_floor`] reads it for the one-component
+/// boards.
+fn erot_floor(driver: &PlatformDriver<MockBoard, 2>) -> Svn {
+    driver
+        .board()
+        .self_update
+        .as_ref()
+        .expect("the test wired a self-update")
+        .floor
+        .floor()
+        .expect("floor unreadable")
+}
+
+/// The state the eRoT's own update session reads.
+fn erot_session_state(driver: &PlatformDriver<MockBoard, 2>) -> SelfUpdateState {
+    driver
+        .board()
+        .self_update
+        .as_ref()
+        .expect("the test wired a self-update")
+        .session
+        .state()
+        .expect("session unreadable")
+}
+
+// The agent requests the eRoT's floor the way it requests any other
+// component's: `Event::SvnCommitRequest` in, `Effect::CommitSvnFloor`
+// out. The driver reads the eRoT's floor out of the `ErotUpdate` rather
+// than the component wiring, because that is where it lives, next to
+// the session that says which SVN the trial confirmed.
+#[test]
+fn the_request_advances_the_erot_svn_floor() {
+    let mut orch = erot_orchestrator();
+    let mut driver = erot_driver(trial_session(SelfUpdateState::TrialPending {
+        svn: Svn(SELF_TRIAL_SVN),
+    }));
+
+    orch.dispatch(&mut driver, Event::SelfTrialBooted);
+    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
+    orch.dispatch(&mut driver, Event::Booted(ComponentId::new(1)));
+    assert_eq!(orch.state(), State::Ready);
+    assert_ne!(
+        erot_floor(&driver),
+        Svn(SELF_TRIAL_SVN),
+        "confirming the trial does not move the floor"
+    );
+
+    orch.dispatch(&mut driver, Event::SvnCommitRequest(C0));
+
+    assert_eq!(
+        erot_floor(&driver),
+        Svn(SELF_TRIAL_SVN),
+        "the floor took the SVN the confirmed trial recorded"
+    );
+    assert_eq!(
+        erot_session_state(&driver),
+        SelfUpdateState::Idle,
+        "and the session closed behind it"
+    );
+}
+
+// A request with no confirmed self-update behind it. No trial confirmed
+// an SVN, so there is none to move the floor to and the effect fails
+// rather than quietly succeeding.
+#[test]
+fn a_request_with_no_confirmed_self_update_is_refused() {
+    use openprot_orchestrator_sm::EffectError;
+
+    let mut driver = erot_driver(MockSelfUpdate::idle());
+    let before = erot_floor(&driver);
+
+    assert_eq!(
+        driver.execute(Effect::CommitSvnFloor(C0)),
+        Err(EffectError),
+        "no trial has been confirmed"
+    );
+    assert_eq!(erot_floor(&driver), before, "and the floor did not move");
+}
+
+// ---------------------------------------------------------------------------
 // Bringing the spare slot up to date after a commit
 // ---------------------------------------------------------------------------
 
@@ -3554,262 +4135,6 @@ fn a_discarded_update_cancels_the_pending_resync() {
     );
 }
 
-/// A one-component driver whose board keeps `session` as the eRoT's own
-/// update session.
-fn self_trial_driver(session: MockSelfUpdate) -> PlatformDriver<MockBoard, 1> {
-    PlatformDriver::new(
-        &passive_entries(),
-        Board {
-            self_update: Some(ErotUpdate {
-                session,
-                floor: MockFloor::new(),
-                reset: MockSelfReset::new(),
-            }),
-            ..mock_board()
-        },
-    )
-}
-
-/// The eRoT's own session in the state the test needs, with the trial
-/// image running.
-fn trial_session(state: SelfUpdateState) -> MockSelfUpdate {
-    MockSelfUpdate::with_session(state, RunningImage::Trial)
-}
-
-/// What the board's self-update session reads.
-fn session_state(driver: &PlatformDriver<MockBoard, 1>) -> SelfUpdateState {
-    driver
-        .board()
-        .self_update
-        .as_ref()
-        .expect("the test wired a self-update")
-        .session
-        .state
-}
-
-/// What the floor next to that session reads.
-fn self_floor(driver: &PlatformDriver<MockBoard, 1>) -> Svn {
-    driver
-        .board()
-        .self_update
-        .as_ref()
-        .expect("the test wired a self-update")
-        .floor
-        .floor()
-        .expect("the mock does not fault")
-}
-
-// The trial image booted and the chain came up behind it, so the machine
-// confirms the session on its way into Ready. The floor stays where it is:
-// advancing it is the update agent's to ask for.
-#[test]
-fn a_trial_that_reaches_ready_is_confirmed() {
-    let mut orch = orchestrator();
-    let mut driver =
-        self_trial_driver(trial_session(SelfUpdateState::TrialPending { svn: Svn(7) }));
-    let floor_before = self_floor(&driver);
-
-    orch.dispatch(&mut driver, Event::SelfTrialBooted);
-    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
-
-    assert_eq!(orch.state(), State::Ready);
-    assert_eq!(
-        session_state(&driver),
-        SelfUpdateState::Committed { svn: Svn(7) }
-    );
-    assert_eq!(
-        self_floor(&driver),
-        floor_before,
-        "confirming is not committing"
-    );
-}
-
-// An ordinary boot on the same board. Nothing said a trial was running, so
-// the session is left where it is.
-#[test]
-fn a_boot_with_no_trial_leaves_the_session_alone() {
-    let mut orch = orchestrator();
-    let mut driver = self_trial_driver(MockSelfUpdate::idle());
-
-    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
-
-    assert_eq!(orch.state(), State::Ready);
-    assert_eq!(session_state(&driver), SelfUpdateState::Idle);
-}
-
-// The event says the settle call produced it and the board has
-// none, so the
-// two disagree about whether this eRoT updates itself. The effect fails and
-// the platform locks down rather than carrying on with a trial nothing can
-// confirm.
-#[test]
-fn confirming_a_trial_with_no_self_update_locks_down() {
-    let mut orch = orchestrator();
-    let mut driver = driver([MemImage::holding(valid_image())]);
-
-    orch.dispatch(&mut driver, Event::SelfTrialBooted);
-    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
-
-    assert_eq!(orch.state(), State::Locked);
-}
-
-// The session write fails. Same fail-secure answer: the trial is not
-// confirmed and the platform locks down.
-#[test]
-fn a_session_that_cannot_be_written_locks_down() {
-    let mut orch = orchestrator();
-    let mut driver = self_trial_driver(MockSelfUpdate {
-        fail: true,
-        ..trial_session(SelfUpdateState::TrialPending { svn: Svn(7) })
-    });
-
-    orch.dispatch(&mut driver, Event::SelfTrialBooted);
-    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
-
-    assert_eq!(orch.state(), State::Locked);
-}
-
-// The boot that runs a trial image. The driver reads the board's own
-// session and names the event the state machine needs in order to judge
-// the trial.
-#[test]
-fn settling_a_running_trial_names_the_event_to_dispatch() {
-    let mut driver =
-        self_trial_driver(trial_session(SelfUpdateState::TrialPending { svn: Svn(7) }));
-
-    let settlement = driver
-        .settle_self_update_session()
-        .expect("the mock does not fault");
-
-    assert_eq!(
-        settlement,
-        SelfUpdateSettlement::TrialRunning { svn: Svn(7) }
-    );
-    assert_eq!(settlement.event(), Some(Event::SelfTrialBooted));
-    assert_eq!(
-        session_state(&driver),
-        SelfUpdateState::TrialPending { svn: Svn(7) },
-        "settling judges nothing"
-    );
-}
-
-// A board that never updates itself wires no self-update. There is no
-// session to settle and nothing to tell the machine.
-#[test]
-fn a_board_with_no_self_update_is_already_settled() {
-    let mut driver = driver([MemImage::holding(valid_image())]);
-
-    let settlement = driver
-        .settle_self_update_session()
-        .expect("nothing to read");
-
-    assert_eq!(settlement, SelfUpdateSettlement::Settled);
-    assert_eq!(settlement.event(), None);
-}
-
-// A confirmed session the floor has not taken yet. The advance is the
-// update agent's to ask for, and no trial is running, so the settlement
-// names no event.
-#[test]
-fn settling_an_awaited_floor_advance_names_no_event() {
-    let mut driver = self_trial_driver(trial_session(SelfUpdateState::Committed { svn: Svn(7) }));
-
-    let settlement = driver
-        .settle_self_update_session()
-        .expect("the mock does not fault");
-
-    assert_eq!(
-        settlement,
-        SelfUpdateSettlement::AwaitingFloorAdvance { svn: Svn(7) }
-    );
-    assert_eq!(settlement.event(), None);
-}
-
-// The session reads `Idle` while the trial image is still running. That is
-// what a revert leaves behind: it puts the slot metadata back but cannot
-// unrun the image, so the part keeps running what it booted until the next
-// reset. No trial is open, so the settlement names no event.
-#[test]
-fn settling_an_unclaimed_image_names_no_event() {
-    let mut driver = self_trial_driver(trial_session(SelfUpdateState::Idle));
-
-    let settlement = driver
-        .settle_self_update_session()
-        .expect("the mock does not fault");
-
-    assert_eq!(settlement, SelfUpdateSettlement::UnclaimedImageRunning);
-    assert_eq!(settlement.event(), None);
-}
-
-// The boot-time call: settling a running trial dispatches the event, so
-// the machine knows the trial is being judged before the walk starts.
-#[test]
-fn settling_at_boot_dispatches_the_trial_event() {
-    let mut orch = orchestrator();
-    let mut driver =
-        self_trial_driver(trial_session(SelfUpdateState::TrialPending { svn: Svn(7) }));
-
-    let settlement = settle_self_update_at_boot(&mut orch, &mut driver).expect("no fault");
-
-    assert_eq!(
-        settlement,
-        SelfUpdateSettlement::TrialRunning { svn: Svn(7) }
-    );
-    // The machine has not walked yet, so nothing is confirmed. The first
-    // `Ready` is what does that.
-    assert_eq!(
-        session_state(&driver),
-        SelfUpdateState::TrialPending { svn: Svn(7) }
-    );
-
-    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
-
-    assert_eq!(orch.state(), State::Ready);
-    assert_eq!(
-        session_state(&driver),
-        SelfUpdateState::Committed { svn: Svn(7) }
-    );
-}
-
-// Nothing was in flight, so no event reaches the state machine and the
-// boot walks as any other.
-#[test]
-fn settling_at_boot_with_no_session_dispatches_nothing() {
-    let mut orch = orchestrator();
-    let mut driver = self_trial_driver(MockSelfUpdate::idle());
-
-    let settlement = settle_self_update_at_boot(&mut orch, &mut driver).expect("no fault");
-
-    assert_eq!(settlement, SelfUpdateSettlement::Settled);
-
-    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
-
-    assert_eq!(orch.state(), State::Ready);
-    assert_eq!(session_state(&driver), SelfUpdateState::Idle);
-}
-
-// The session could not be read. The boot has no honest answer about the
-// last self-update, so nothing is dispatched and the fault is the
-// caller's to act on.
-#[test]
-fn settling_at_boot_passes_a_storage_fault_back() {
-    let mut orch = orchestrator();
-    let mut driver = self_trial_driver(MockSelfUpdate {
-        fail: true,
-        ..trial_session(SelfUpdateState::TrialPending { svn: Svn(7) })
-    });
-
-    assert!(settle_self_update_at_boot(&mut orch, &mut driver).is_err());
-
-    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
-
-    assert_eq!(
-        orch.state(),
-        State::Ready,
-        "no trial was declared, so the walk is an ordinary boot"
-    );
-}
-
 // The authenticated pass reads the candidate's SVN, and the floor must
 // not take it. The floor takes what the post-activation walk read back
 // from the image the device is now running, which is the only evidence
@@ -3961,321 +4286,4 @@ fn a_versionless_image_still_resyncs_the_spare_slot() {
         driver.board().components[0].updatable.stagings > staged_before,
         "the spare was never sent the image"
     );
-}
-
-/// The eRoT at position 0, where `chain_of` puts it, and a passive device
-/// behind it. The eRoT alone never leaves `PreSupervision`, so driving the
-/// machine needs the device too.
-///
-/// The component kind decides which update path runs, in the state
-/// machine and in the driver alike. These tests build the two separately,
-/// so both take their chain from this helper and cannot disagree about
-/// which component is the eRoT.
-fn erot_chain() -> [(ComponentId, ComponentAttrs); EROT_N] {
-    entries_with_kinds([ComponentKind::Erot, ComponentKind::Passive])
-}
-
-/// Length of the eRoT chain: the eRoT and the one device behind it.
-const EROT_N: usize = 2;
-/// The effect buffer `Rot` requires for `EROT_N` components.
-const EROT_E: usize = 2 * EROT_N + 2;
-
-fn erot_orchestrator() -> Orchestrator<EROT_N, EROT_E> {
-    let chain = heapless::Vec::<_, EROT_N>::from_slice(&erot_chain()).expect("two fits");
-    Orchestrator::new(chain.try_into().unwrap(), MOCK_MAX_RETRY)
-}
-
-/// A driver over that chain with `session` as the eRoT's update session.
-fn erot_driver(session: MockSelfUpdate) -> PlatformDriver<MockBoard, EROT_N> {
-    erot_driver_with(session, StubVerifier::accepting())
-}
-
-fn erot_driver_with(
-    session: MockSelfUpdate,
-    update_verifier: StubVerifier,
-) -> PlatformDriver<MockBoard, EROT_N> {
-    PlatformDriver::new(
-        &erot_chain(),
-        Board {
-            self_update: Some(ErotUpdate {
-                session,
-                floor: MockFloor::new(),
-                reset: MockSelfReset::new(),
-            }),
-            update_verifier: Some(update_verifier),
-            ..mock_board()
-        },
-    )
-}
-
-/// Brings the state machine to `Ready`: the walk steps past the eRoT and
-/// the device behind it boots.
-fn erot_chain_up(
-    orch: &mut Orchestrator<EROT_N, EROT_E>,
-    driver: &mut PlatformDriver<MockBoard, EROT_N>,
-) {
-    orch.dispatch(driver, Event::PowerGood(PowerOnResult::Provisioned));
-    orch.dispatch(driver, Event::Booted(ComponentId::new(1)));
-    assert_eq!(orch.state(), State::Ready, "the chain is up");
-}
-
-/// Pumps the update until the verifier reaches a verdict:
-/// `UpdateVerified` for a candidate the eRoT may install,
-/// `UpdateRejected` for one it may not.
-fn pump_to_verdict<const N: usize>(driver: &mut PlatformDriver<MockBoard, N>) -> Event {
-    for tick in 0..16 {
-        if let Some(event) = driver.pump_update(tick).event {
-            return event;
-        }
-    }
-    panic!("the pump reached no verdict");
-}
-
-// `prepare` records the SVN before `set_trial_pending` marks the trial,
-// the order SelfUpdate states. A crash between the two leaves a pending
-// trial the next boot reads as unconfirmed; the other order would boot a
-// trial with no session to judge it.
-//
-// The SVN recorded is the candidate image's, the only one the eRoT ever
-// reads of itself. See "Where the SVN comes from" in
-// docs/src/design/erot-self-verification.md.
-#[test]
-fn activating_the_erots_own_update_records_the_session_then_reaches_the_reset() {
-    assert_ne!(
-        CANDIDATE_SVN, MOCK_SVN,
-        "the two SVN fixtures have to differ or this test proves nothing"
-    );
-    let mut driver = erot_driver(MockSelfUpdate::idle());
-    driver.submit_update(C0, CANDIDATE_LEN).unwrap();
-    driver.prepare_update().unwrap();
-    assert_eq!(pump_to_verdict(&mut driver), Event::UpdateVerified);
-
-    assert_eq!(
-        driver.activate_update(),
-        Err(DriverError::SelfResetFault),
-        "the mock cannot reset the process it runs in"
-    );
-
-    let self_update = driver.board().self_update.as_ref().expect("wired above");
-    assert_eq!(
-        self_update.session.state(),
-        Ok(SelfUpdateState::TrialPending {
-            svn: Svn(CANDIDATE_SVN)
-        }),
-        "the session holds the candidate's own SVN, marked pending"
-    );
-    assert_eq!(self_update.reset.attempts, 1, "the reset was reached");
-}
-
-// The candidate for the eRoT authenticated with no manifest SVN, so there
-// is no session to record. The pump rejects it, the update ends and the
-// state machine returns to Ready. Rejecting at the activation would fail
-// that effect and lock the platform, which a missing version does not
-// warrant.
-#[test]
-fn a_versionless_self_candidate_ends_the_update_without_locking() {
-    let mut orch = erot_orchestrator();
-    let mut driver = erot_driver_with(MockSelfUpdate::idle(), StubVerifier::unversioned());
-    erot_chain_up(&mut orch, &mut driver);
-
-    request_update(&mut orch, &mut driver, C0, CANDIDATE_LEN).expect("the request is accepted");
-    assert_eq!(orch.state(), State::Updating(C0));
-
-    let verdict = pump_to_verdict(&mut driver);
-    assert_eq!(verdict, Event::UpdateRejected, "the pump rejected it");
-    assert!(driver
-        .board()
-        .report_sink
-        .seen
-        .contains(&Report::SelfImageNoSvn));
-
-    orch.dispatch(&mut driver, verdict);
-    assert_eq!(
-        orch.state(),
-        State::Ready,
-        "the update ended and the platform is not locked"
-    );
-    assert_eq!(driver.pending_update(), None, "and the job is gone");
-
-    let self_update = driver.board().self_update.as_ref().expect("wired above");
-    assert_eq!(
-        self_update.session.state(),
-        Ok(SelfUpdateState::Idle),
-        "nothing was recorded"
-    );
-    assert_eq!(self_update.reset.attempts, 0, "and nothing reset");
-}
-
-// One update at a time, whatever it targets. A request aimed at the eRoT
-// while a device behind it is being updated is refused as `UpdateBusy`,
-// and the job already in flight is untouched.
-//
-// The board wires no self-update either, so the self-update check would
-// refuse the request too. The answer is `UpdateBusy` and not
-// `NoErotUpdate` because the busy check in submit_update runs
-// first.
-#[test]
-fn an_erot_update_is_refused_while_a_device_update_is_in_flight() {
-    let mut driver = PlatformDriver::<MockBoard, EROT_N>::new(&erot_chain(), mock_board());
-    driver
-        .submit_update(C1, CANDIDATE_LEN)
-        .expect("the device update starts");
-
-    assert_eq!(
-        driver.submit_update(C0, CANDIDATE_LEN),
-        Err(DriverError::UpdateBusy)
-    );
-    assert_eq!(
-        driver.pending_update(),
-        Some(C1),
-        "the device update is still the one in flight"
-    );
-}
-
-// A board with no `ErotUpdate` cannot record the session the
-// update needs.
-// Accepting would run it to the activation, where the effect fails and
-// locks the platform. Refused at submit, the state machine never leaves
-// Ready.
-#[test]
-fn an_update_aimed_at_the_erot_is_refused_when_the_board_wires_no_self_update() {
-    let mut orch = erot_orchestrator();
-    let mut driver = PlatformDriver::<MockBoard, EROT_N>::new(&erot_chain(), mock_board());
-    erot_chain_up(&mut orch, &mut driver);
-
-    assert_eq!(
-        request_update(&mut orch, &mut driver, C0, CANDIDATE_LEN),
-        Err(DriverError::NoErotUpdate)
-    );
-    assert_eq!(orch.state(), State::Ready, "the request reached nothing");
-    assert_eq!(driver.pending_update(), None, "and stored nothing");
-}
-
-// A trial was confirmed but its SVN has not reached the floor. A second
-// update would overwrite the session holding it, and the floor would
-// never get it.
-#[test]
-fn a_second_self_update_is_refused_while_the_first_awaits_its_floor() {
-    let mut driver = erot_driver(MockSelfUpdate::with_session(
-        SelfUpdateState::Committed { svn: Svn(7) },
-        RunningImage::Confirmed,
-    ));
-
-    assert_eq!(
-        driver.submit_update(C0, CANDIDATE_LEN),
-        Err(DriverError::UpdateBusy)
-    );
-    assert_eq!(driver.pending_update(), None, "nothing was stored");
-    let self_update = driver.board().self_update.as_ref().expect("wired above");
-    assert_eq!(
-        self_update.session.state(),
-        Ok(SelfUpdateState::Committed { svn: Svn(7) }),
-        "and the session still holds the confirmed SVN"
-    );
-}
-
-// The same while the trial is being judged: this boot is the trial, and a
-// new record would overwrite the session that judges it.
-#[test]
-fn a_self_update_is_refused_while_the_trial_is_being_judged() {
-    let mut driver = erot_driver(trial_session(SelfUpdateState::TrialPending { svn: Svn(7) }));
-
-    assert_eq!(
-        driver.submit_update(C0, CANDIDATE_LEN),
-        Err(DriverError::UpdateBusy)
-    );
-}
-
-// A trial image that booted once and was not confirmed: the reset after
-// booted the old image again, so no boot that could confirm the trial
-// will come, and settlement drops the session either way. A new
-// self-update must not be refused for a session that can only be
-// discarded.
-#[test]
-fn a_self_update_may_start_over_a_trial_that_fell_back() {
-    let mut driver = erot_driver(MockSelfUpdate::with_session(
-        SelfUpdateState::TrialPending { svn: Svn(7) },
-        RunningImage::Confirmed,
-    ));
-
-    assert_eq!(driver.submit_update(C0, CANDIDATE_LEN), Ok(()));
-}
-
-/// The eRoT's own floor, as [`self_floor`] reads it for the one-component
-/// boards.
-fn erot_floor(driver: &PlatformDriver<MockBoard, 2>) -> Svn {
-    driver
-        .board()
-        .self_update
-        .as_ref()
-        .expect("the test wired a self-update")
-        .floor
-        .floor()
-        .expect("floor unreadable")
-}
-
-/// The state the eRoT's own update session reads.
-fn erot_session_state(driver: &PlatformDriver<MockBoard, 2>) -> SelfUpdateState {
-    driver
-        .board()
-        .self_update
-        .as_ref()
-        .expect("the test wired a self-update")
-        .session
-        .state()
-        .expect("session unreadable")
-}
-
-// The agent requests the eRoT's floor the way it requests any other
-// component's: `Event::SvnCommitRequest` in, `Effect::CommitSvnFloor`
-// out. The driver reads the eRoT's floor out of the `ErotUpdate` rather
-// than the component wiring, because that is where it lives, next to
-// the session that says which SVN the trial confirmed.
-#[test]
-fn the_request_advances_the_erot_svn_floor() {
-    let mut orch = erot_orchestrator();
-    let mut driver = erot_driver(trial_session(SelfUpdateState::TrialPending {
-        svn: Svn(SELF_TRIAL_SVN),
-    }));
-
-    orch.dispatch(&mut driver, Event::SelfTrialBooted);
-    orch.dispatch(&mut driver, Event::PowerGood(PowerOnResult::Provisioned));
-    orch.dispatch(&mut driver, Event::Booted(ComponentId::new(1)));
-    assert_eq!(orch.state(), State::Ready);
-    assert_ne!(
-        erot_floor(&driver),
-        Svn(SELF_TRIAL_SVN),
-        "confirming the trial does not move the floor"
-    );
-
-    orch.dispatch(&mut driver, Event::SvnCommitRequest(C0));
-
-    assert_eq!(
-        erot_floor(&driver),
-        Svn(SELF_TRIAL_SVN),
-        "the floor took the SVN the confirmed trial recorded"
-    );
-    assert_eq!(
-        erot_session_state(&driver),
-        SelfUpdateState::Idle,
-        "and the session closed behind it"
-    );
-}
-
-// A request with no confirmed self-update behind it. No trial confirmed
-// an SVN, so there is none to move the floor to and the effect fails
-// rather than quietly succeeding.
-#[test]
-fn a_request_with_no_confirmed_self_update_is_refused() {
-    use openprot_orchestrator_sm::EffectError;
-
-    let mut driver = erot_driver(MockSelfUpdate::idle());
-    let before = erot_floor(&driver);
-
-    assert_eq!(
-        driver.execute(Effect::CommitSvnFloor(C0)),
-        Err(EffectError),
-        "no trial has been confirmed"
-    );
-    assert_eq!(erot_floor(&driver), before, "and the floor did not move");
 }
