@@ -1,0 +1,17 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_rust//rust:defs.bzl", "rust_test")
+
+# Host end-to-end: the Recovery Agent sequence for streaming boot, driven
+# through ocp_recovery_server::dispatch with the bytes the transport hands
+# the device. No kernel, no QEMU, no transport.
+rust_test(
+    name = "agent_sequence_host_test",
+    srcs = ["agent_sequence_host.rs"],
+    edition = "2024",
+    deps = [
+        "//services/ocp-recovery/api:ocp_recovery_api",
+        "//services/ocp-recovery/server:ocp_recovery_server",
+    ],
+)
