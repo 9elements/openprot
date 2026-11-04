@@ -35,6 +35,7 @@
   * [IPC service stack](./design/ipc-service-stack.md)
   * [Trust Boundaries](./design/trust-boundaries.md)
   * [eRoT Self-Verification](./design/erot-self-verification.md)
+  * [OCP streaming boot](./design/ocp-recovery.md)
   * [Orchestrator](./design/orchestrator/orchestrator-overview.md)
     * [Verification Model](./design/orchestrator/orchestrator-model.md)
     * [State Machine](./design/orchestrator/orchestrator-machine.md)
