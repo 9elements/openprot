@@ -13,6 +13,10 @@ of the project.
 -   [**pw_kernel IPC**](./pw-kernel-ipc.md): How to declare and use channel
     objects to communicate between two `pw_kernel` userspace processes.
     Worked example lives at `target/veer/ipc/`.
+-   [**OCP Recovery Streaming Boot**](./ocp-recovery.md): The eRoT as the
+    Device of the OCP Recovery interface, with the BMC as the Recovery
+    Agent. Covers the streaming sequence, where the pushed bytes land, who
+    verifies and boots the image, and which image serves the registers.
 -   [**Orchestrator**](./orchestrator/orchestrator-overview.md): The eRoT boot-sequence state
     machine (`services/orchestrator/sm`). Covers the two-tier firmware
     verification model (`ComponentAttrs`, eRoT gate, iRoT gate), the
