@@ -10,7 +10,7 @@
 
 use openprot_orchestrator_sm::{Event, Orchestrator};
 use orchestrator_capabilities::{
-    RunningImage, SelfUpdate, SelfUpdateState, Svn, SvnFloor, TrialOutcome,
+    BootSelection, SelfUpdate, SelfUpdateState, Svn, SvnFloor, TrialOutcome,
 };
 
 use super::{DriverError, PlatformDriver};
@@ -147,9 +147,16 @@ impl SelfUpdateSettlement {
 ///   update never ran, or its trial failed and the platform fell back. The
 ///   session is reverted, so the update is done again rather than counted as
 ///   finished.
-/// - A trial image is running that no session claims: the session is reverted,
-///   which also clears the pending mark, so the confirmed image runs after a
-///   reset. The eRoT must not keep running an image nothing vouched for.
+/// - A trial image is running that no session claims, because no session
+///   exists or the session names another SVN: settlement reverts any
+///   session, which also clears the pending mark, so the confirmed image
+///   runs after a reset. The eRoT must not keep running an image that no
+///   session claims.
+/// - The session reads `Committed` but the boot stage started the
+///   confirmed image, at an SVN other than the session SVN or with no SVN:
+///   the boot stage fell back after the confirm. Settlement reverts the
+///   session and the SVN floor keeps the SVN it has, which is at or below
+///   the SVN of the image that runs.
 /// - The session is confirmed and the floor is still below its SVN: the floor
 ///   advance is what is left, and the Update Agent requests it, so this
 ///   boot must not do it.
@@ -192,7 +199,7 @@ pub fn settle_self_update<S: SelfUpdate, F: SvnFloor>(
         }
         TrialOutcome::Unconfirmed => {
             session.revert().map_err(SettleError::Session)?;
-            if running == RunningImage::Trial {
+            if running.selected == BootSelection::Trial {
                 return Ok(SelfUpdateSettlement::UnclaimedImageRunning);
             }
             Ok(SelfUpdateSettlement::Settled)
@@ -305,10 +312,13 @@ pub enum CommitFloorError<S, F> {
     Session(S),
     /// Writing the eRoT's own anti-rollback floor failed.
     Floor(F),
-    /// No confirmed self-update is waiting for the floor, so there is no SVN
-    /// an image has proven itself at. Carries what the session says: `Idle`
-    /// when no self-update is in flight or the request arrived a second time,
-    /// `TrialPending` when it arrived before the trial boot was judged.
+    /// No confirmed self-update is waiting for the SVN floor advance, so the
+    /// request has no SVN to write into the SVN floor. Carries what the
+    /// session says: `Idle` when
+    /// no self-update is in flight or the request arrived a second time,
+    /// `TrialPending` when it arrived before the trial boot was judged, and
+    /// `Committed` when the image that runs carries an SVN other than the
+    /// session SVN, or no SVN.
     NotConfirmed(SelfUpdateState),
 }
 

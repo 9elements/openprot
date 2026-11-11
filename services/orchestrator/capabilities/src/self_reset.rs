@@ -6,7 +6,7 @@
 /// Actuation capability: reset the eRoT itself.
 ///
 /// Activating the eRoT's own update ends here: record the session, mark
-/// the trial pending, reset. The boot selector then runs the trial image
+/// the trial pending, reset. The boot stage then runs the trial image
 /// and [`settle_self_update`](crate::SelfUpdate) judges it on the way up.
 ///
 /// Not [`BootControl`](crate::BootControl), whose `hold_in_reset` and
