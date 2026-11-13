@@ -90,8 +90,9 @@ abort would do is untested.
   and marks the trial pending; the run ends where the eRoT would reboot.
   `self_trial` starts from that session and judges the boot. Joining them
   needs a reset this target does not have (nothing drives SYSRESETREQ, and
-  QEMU models one chip) and a session in flash rather than in RAM, so the
-  session would survive the reset into the same run.
+  QEMU models one chip). Joining them also needs a board that wires
+  `RecordSession` on flash, so the session survives the reset, and a boot
+  stage that reads the record.
 - A candidate that came from somewhere. `self_update` is its own update
   source: the bytes are a constant and the slot counts them rather than
   writing them, because nothing serves the eRoT's own update over PLDM
@@ -264,6 +265,82 @@ answer says granted while the floor still holds the old SVN. Two changes
 close this: re-attempt the pass or mark the slot stale somewhere
 durable, and answer the Update Agent once the SVN floor advances
 rather than when the effect arrives.
+
+## What the self-update record does not settle
+
+`RecordSession` keeps the self-update session of the eRoT in a record on
+flash, and the boot stage reads the record to pick the slot it starts,
+by the rule that `select` states. No board wires `RecordSession`, and the
+tree holds no boot stage that runs `select`. The trial watchdog, the lock
+on the tried-mark region and the handover mechanism belong to the boot
+stage, and the tree has no code for them.
+
+- The boot code on the first board. Which program reads the record,
+  writes the tried mark and hands over the started slot is undecided, and
+  so is whether that program lives in this tree.
+- Layouts an eRoT update cannot change. The boot stage holds the slot
+  list and the layouts of the record, the tried mark and the handover, and
+  an eRoT update does not replace the boot stage. The record carries
+  `RECORD_VERSION`, the tried mark and the handover carry no version, and
+  `Handover` has no byte layout yet. The orchestrator has no check that
+  refuses an update image built for another layout version. An eRoT that
+  reads a record of another version treats the record as missing and
+  writes a fresh record, so the eRoT loses the session of an update in
+  flight.
+- A record lost during a trial. When neither copy decodes, the boot stage
+  walks the slots in layout order. If the trial slot comes before the
+  confirmed slot in layout order, the boot stage starts the trial image
+  with no tried mark and no trial watchdog, and the eRoT writes the trial
+  slot in as confirmed without a confirm.
+- Erasing the record picks the slot. Whoever can erase both copies makes
+  the boot stage walk and start the first slot that passes. The signature
+  check and the SVN floor check still run, so the started image is signed
+  and at or above the SVN floor, and the started image can be older than
+  the confirmed image.
+- A stale tried mark after a lost record. The fresh record restarts the
+  write counter, and the tried mark keeps its counter. A later
+  `TrialPending` record with the same counter reads as tried, so the boot
+  stage starts the confirmed slot and settlement reverts the session. The
+  Update Agent has to send the update again, and the next session runs
+  its trial under a new counter.
+- A flash fault on the newest record copy. The boot stage then reads the
+  copy one write older. A `Committed` session reads as `TrialPending`
+  with a tried mark that matches, so the boot stage starts the confirmed
+  slot and settlement reverts an update the eRoT had confirmed. If the
+  update raised the SVN and the SVN floor advance ran before the fault,
+  the SVN floor check rejects the confirmed image. `select` excludes the
+  trial slot of the `TrialPending` session from the walk, so on a layout
+  of 2 slots the boot stage starts the golden image in recovery mode.
+- No slot for a new update while a reverted trial runs. After a revert
+  in the trial boot on a layout of 2 slots, the trial slot runs and the
+  other slot holds the confirmed image, so `prepare` returns `NoFreeSlot`
+  until the next reset starts the confirmed slot.
+- `RecordSession` polls `Storage::is_busy` with no timeout, so a flash
+  part that stays busy holds the orchestrator in the poll.
+- One meaning of reset. The tried-mark lock, the trial watchdog and
+  `SelfReset` must act on the same reset. No trait states which reset
+  each of them uses.
+- Confirm once the chain is up. The eRoT confirms a self-update trial
+  once the chain comes up behind the trial image. On a platform whose
+  downstream hardware fails, the chain stays down, so the eRoT does not
+  confirm an eRoT update, and the boot after the trial reverts the eRoT
+  update.
+- A walk after the confirm. When the signature check or the SVN floor
+  check rejects the confirmed slot of a `Committed` session, the boot
+  stage walks the slots in layout order and starts the first slot that
+  passes. On a layout of 3 slots or more, that slot can come before the
+  previous slot. `RecordSession::open` then writes the started slot in as
+  confirmed with no session, so settlement finds no session and the SVN
+  floor keeps the SVN it has. `open` returns
+  `Found::Rewritten(Rewrite::Walked)`, the same value as after a walk
+  from a `Prepared` or `TrialPending` record, so the board cannot tell
+  from that value whether the boot stage rejected the new image.
+- A running-SVN compare for a downstream device. `DeviceTrialBoot` takes
+  no SVN. Whether a downstream device trial should compare the SVN of the
+  running image, the way `trial_outcome` does for the eRoT, is undecided.
+- A boot that started no slot. When every slot fails its checks, the boot
+  stage starts the golden image in recovery mode. `Handover` has no value
+  for that boot, so `running()` has no answer yet.
 
 ## Assertions that are looser than they look
 
