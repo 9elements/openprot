@@ -817,18 +817,27 @@ impl SelfReset for MockSelfReset {
 }
 
 /// The eRoT's own update session, in RAM. `running` says which image this
-/// boot runs, the trial one or the confirmed one, as a test sets it.
+/// boot runs, the trial one or the confirmed one and at which SVN, as a
+/// test sets it.
 struct MockSelfUpdate {
     state: SelfUpdateState,
     running: RunningImage,
     fail: bool,
 }
 
+/// The SVN of the image the eRoT ran before any update in these tests.
+/// Every session SVN below is higher, so no session SVN equals the SVN of
+/// this image.
+const OLD_SVN: Svn = Svn(3);
+/// An SVN no session in these tests records: the image of some other
+/// update, started by the boot stage without a session behind it.
+const FOREIGN_SVN: Svn = Svn(9);
+
 impl MockSelfUpdate {
     fn idle() -> Self {
         Self {
             state: SelfUpdateState::Idle,
-            running: RunningImage::Confirmed,
+            running: RunningImage::confirmed(OLD_SVN),
             fail: false,
         }
     }
@@ -2823,7 +2832,7 @@ fn settle_with_no_session_changes_nothing() {
 #[test]
 fn settle_reports_a_running_trial_and_leaves_the_session() {
     let pending = SelfUpdateState::TrialPending { svn: Svn(7) };
-    let mut session = MockSelfUpdate::with_session(pending, RunningImage::Trial);
+    let mut session = MockSelfUpdate::with_session(pending, RunningImage::trial(Svn(7)));
 
     assert_eq!(
         settle_self_update(&mut session, &MockFloor::new()),
@@ -2839,7 +2848,7 @@ fn settle_reports_a_running_trial_and_leaves_the_session() {
 fn settle_reverts_a_trial_that_fell_back() {
     let mut session = MockSelfUpdate::with_session(
         SelfUpdateState::TrialPending { svn: Svn(7) },
-        RunningImage::Confirmed,
+        RunningImage::confirmed(OLD_SVN),
     );
 
     assert_eq!(
@@ -2857,7 +2866,7 @@ fn settle_reverts_a_trial_that_fell_back() {
 #[test]
 fn settle_keeps_a_confirmed_session_the_floor_has_not_taken() {
     let committed = SelfUpdateState::Committed { svn: Svn(7) };
-    let mut session = MockSelfUpdate::with_session(committed, RunningImage::Trial);
+    let mut session = MockSelfUpdate::with_session(committed, RunningImage::trial(Svn(7)));
     let floor = MockFloor::with_floor(Svn(3));
 
     assert_eq!(
@@ -2876,7 +2885,7 @@ fn settle_keeps_a_confirmed_session_the_floor_has_not_taken() {
 fn settle_completes_a_session_whose_floor_already_moved() {
     let mut session = MockSelfUpdate::with_session(
         SelfUpdateState::Committed { svn: Svn(7) },
-        RunningImage::Trial,
+        RunningImage::trial(Svn(7)),
     );
 
     assert_eq!(
@@ -2893,7 +2902,7 @@ fn settle_completes_a_session_whose_floor_already_moved() {
 fn settle_completes_a_session_whose_floor_moved_past_it() {
     let mut session = MockSelfUpdate::with_session(
         SelfUpdateState::Committed { svn: Svn(7) },
-        RunningImage::Trial,
+        RunningImage::trial(Svn(7)),
     );
 
     assert_eq!(
@@ -2923,7 +2932,7 @@ fn settle_with_an_unreadable_session_fails_secure() {
 #[test]
 fn settle_with_an_unreadable_floor_fails_secure() {
     let committed = SelfUpdateState::Committed { svn: Svn(7) };
-    let mut session = MockSelfUpdate::with_session(committed, RunningImage::Trial);
+    let mut session = MockSelfUpdate::with_session(committed, RunningImage::trial(Svn(7)));
 
     assert_eq!(
         settle_self_update(&mut session, &MockFloor::faulting()),
@@ -2938,7 +2947,69 @@ fn settle_with_an_unreadable_floor_fails_secure() {
 // after a reset.
 #[test]
 fn settle_reports_an_unclaimed_image_and_reverts_the_session() {
-    let mut session = MockSelfUpdate::with_session(SelfUpdateState::Idle, RunningImage::Trial);
+    let mut session =
+        MockSelfUpdate::with_session(SelfUpdateState::Idle, RunningImage::trial(Svn(7)));
+
+    assert_eq!(
+        settle_self_update(&mut session, &MockFloor::new()),
+        Ok(SelfUpdateSettlement::UnclaimedImageRunning)
+    );
+
+    assert_eq!(session.state, SelfUpdateState::Idle);
+}
+
+// Confirmed, but the boot stage fell back after the confirm: the old
+// image runs. Settlement reverts the session, the SVN floor keeps the SVN
+// it has, and settlement returns `Settled`.
+#[test]
+fn settle_reverts_a_confirmed_session_the_boot_stage_fell_back_from() {
+    let mut session = MockSelfUpdate::with_session(
+        SelfUpdateState::Committed { svn: Svn(7) },
+        RunningImage::confirmed(OLD_SVN),
+    );
+    let floor = MockFloor::with_floor(OLD_SVN);
+
+    assert_eq!(
+        settle_self_update(&mut session, &floor),
+        Ok(SelfUpdateSettlement::Settled)
+    );
+
+    assert_eq!(session.state, SelfUpdateState::Idle);
+    assert_eq!(
+        floor.floor(),
+        Ok(OLD_SVN),
+        "the SVN floor keeps the SVN it has"
+    );
+}
+
+// Confirmed, and the boot stage still calls the running image the
+// trial, but at an SVN the session never recorded. The session does not
+// claim that image, so settlement reports the image unclaimed and reverts
+// the session.
+#[test]
+fn settle_reports_a_confirmed_session_whose_trial_runs_at_another_svn() {
+    let mut session = MockSelfUpdate::with_session(
+        SelfUpdateState::Committed { svn: Svn(7) },
+        RunningImage::trial(FOREIGN_SVN),
+    );
+
+    assert_eq!(
+        settle_self_update(&mut session, &MockFloor::with_floor(OLD_SVN)),
+        Ok(SelfUpdateSettlement::UnclaimedImageRunning)
+    );
+
+    assert_eq!(session.state, SelfUpdateState::Idle);
+}
+
+// A trial image at an SVN other than the session SVN: the session does
+// not claim the image, so settlement reverts the session and reports the
+// image unclaimed.
+#[test]
+fn settle_reports_a_trial_at_another_svn_unclaimed() {
+    let mut session = MockSelfUpdate::with_session(
+        SelfUpdateState::TrialPending { svn: Svn(7) },
+        RunningImage::trial(FOREIGN_SVN),
+    );
 
     assert_eq!(
         settle_self_update(&mut session, &MockFloor::new()),
@@ -2954,7 +3025,7 @@ fn settle_reports_an_unclaimed_image_and_reverts_the_session() {
 fn commit_advances_the_floor_and_closes_the_session() {
     let mut session = MockSelfUpdate::with_session(
         SelfUpdateState::Committed { svn: Svn(7) },
-        RunningImage::Trial,
+        RunningImage::trial(Svn(7)),
     );
     let mut floor = MockFloor::with_floor(Svn(3));
 
@@ -2984,7 +3055,7 @@ fn commit_without_a_session_is_refused() {
 #[test]
 fn commit_during_a_trial_is_refused() {
     let pending = SelfUpdateState::TrialPending { svn: Svn(7) };
-    let mut session = MockSelfUpdate::with_session(pending, RunningImage::Trial);
+    let mut session = MockSelfUpdate::with_session(pending, RunningImage::trial(Svn(7)));
     let mut floor = MockFloor::with_floor(Svn(3));
 
     assert_eq!(
@@ -2995,6 +3066,23 @@ fn commit_during_a_trial_is_refused() {
     assert_eq!(floor.floor(), Ok(Svn(3)));
 }
 
+// Confirmed, but the image that runs carries another SVN. The SVN floor
+// must not move past the image that runs, so the commit refuses the
+// request.
+#[test]
+fn commit_while_an_image_at_another_svn_runs_is_refused() {
+    let committed = SelfUpdateState::Committed { svn: Svn(7) };
+    let mut session = MockSelfUpdate::with_session(committed, RunningImage::confirmed(OLD_SVN));
+    let mut floor = MockFloor::with_floor(OLD_SVN);
+
+    assert_eq!(
+        commit_self_svn_floor(&mut session, &mut floor),
+        Err(CommitFloorError::NotConfirmed(committed))
+    );
+
+    assert_eq!(floor.floor(), Ok(OLD_SVN));
+}
+
 // The eRoT crashed after the floor moved to 7 but before the session closed.
 // The Update Agent requests again: advancing to 7 a second time changes
 // nothing, and this run closes the session. A third request has no
@@ -3003,7 +3091,7 @@ fn commit_during_a_trial_is_refused() {
 fn commit_repeated_after_a_crash_finishes_the_close() {
     let mut session = MockSelfUpdate::with_session(
         SelfUpdateState::Committed { svn: Svn(7) },
-        RunningImage::Trial,
+        RunningImage::trial(Svn(7)),
     );
     let mut floor = MockFloor::with_floor(Svn(7));
 
@@ -3025,7 +3113,7 @@ fn commit_repeated_after_a_crash_finishes_the_close() {
 #[test]
 fn commit_with_a_floor_that_cannot_advance_leaves_the_session_open() {
     let committed = SelfUpdateState::Committed { svn: Svn(7) };
-    let mut session = MockSelfUpdate::with_session(committed, RunningImage::Trial);
+    let mut session = MockSelfUpdate::with_session(committed, RunningImage::trial(Svn(7)));
 
     assert_eq!(
         commit_self_svn_floor(&mut session, &mut MockFloor::faulting()),
@@ -3044,7 +3132,7 @@ fn commit_with_a_floor_that_cannot_advance_leaves_the_session_open() {
 fn commit_with_an_unreadable_session_fails_secure() {
     let mut session = MockSelfUpdate::with_session(
         SelfUpdateState::Committed { svn: Svn(7) },
-        RunningImage::Trial,
+        RunningImage::trial(Svn(7)),
     );
     session.fail = true;
     let mut floor = MockFloor::with_floor(Svn(3));
@@ -3574,7 +3662,13 @@ fn self_trial_driver(session: MockSelfUpdate) -> PlatformDriver<MockBoard, 1> {
 /// The eRoT's own session in the state the test needs, with the trial
 /// image running.
 fn trial_session(state: SelfUpdateState) -> MockSelfUpdate {
-    MockSelfUpdate::with_session(state, RunningImage::Trial)
+    let svn = match state {
+        SelfUpdateState::Idle => OLD_SVN,
+        SelfUpdateState::Prepared { svn }
+        | SelfUpdateState::TrialPending { svn }
+        | SelfUpdateState::Committed { svn } => svn,
+    };
+    MockSelfUpdate::with_session(state, RunningImage::trial(svn))
 }
 
 /// What the board's self-update session reads.
@@ -4159,7 +4253,7 @@ fn an_update_aimed_at_the_erot_is_refused_when_the_board_wires_no_self_update() 
 fn a_second_self_update_is_refused_while_the_first_awaits_its_floor() {
     let mut driver = erot_driver(MockSelfUpdate::with_session(
         SelfUpdateState::Committed { svn: Svn(7) },
-        RunningImage::Confirmed,
+        RunningImage::confirmed(Svn(7)),
     ));
 
     assert_eq!(
@@ -4196,7 +4290,22 @@ fn a_self_update_is_refused_while_the_trial_is_being_judged() {
 fn a_self_update_may_start_over_a_trial_that_fell_back() {
     let mut driver = erot_driver(MockSelfUpdate::with_session(
         SelfUpdateState::TrialPending { svn: Svn(7) },
-        RunningImage::Confirmed,
+        RunningImage::confirmed(OLD_SVN),
+    ));
+
+    assert_eq!(driver.submit_update(C0, CANDIDATE_LEN), Ok(()));
+}
+
+// A confirmed session while an image at another SVN runs: the boot
+// stage fell back after the confirm. Settlement reverts the session, and
+// the commit refuses the SVN floor request for the session. The session
+// must not block the next self-update until a reset, so `submit_update`
+// accepts a new update.
+#[test]
+fn a_self_update_may_start_over_a_confirmed_session_the_boot_stage_fell_back_from() {
+    let mut driver = erot_driver(MockSelfUpdate::with_session(
+        SelfUpdateState::Committed { svn: Svn(7) },
+        RunningImage::confirmed(OLD_SVN),
     ));
 
     assert_eq!(driver.submit_update(C0, CANDIDATE_LEN), Ok(()));

@@ -29,22 +29,73 @@
 //! what happened to the trial. What to do about it is the state machine's, the
 //! same split [`BootWatch`](crate::BootWatch) and [`Recovery`](crate::Recovery)
 //! already use: the seam answers with a verdict, the machine decides.
+//!
+//! The boot stage reports the SVN of the image it started, read from the
+//! signed header it checked before the jump. `trial_outcome` compares that
+//! SVN with the session SVN before it calls a trial in progress or
+//! confirmed. A session that names one SVN while an image at another SVN
+//! runs, because the boot stage fell back or a writer with flash access
+//! replaced the session, reads as unconfirmed, and the SVN floor keeps the
+//! SVN it has.
 
 use crate::Svn;
 
-/// Which image the eRoT is running, as durable storage records it.
+/// Which image the boot stage started: the trial one or the confirmed one.
 ///
 /// This, not whether the pending mark is still set, is what tells a trial boot
-/// from a fallback. Platforms differ on the mark: a boot selector that consumes
+/// from a fallback. Platforms differ on the mark: a boot stage that consumes
 /// it leaves nothing set by the time the trial image runs, while one that holds
 /// it until the trial is decided still does. Which image booted reads the same
 /// on both.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RunningImage {
+pub enum BootSelection {
     /// The image the pending mark selects. This boot is the trial.
     Trial,
     /// The image the last confirmed update left in place.
     Confirmed,
+}
+
+/// The image the eRoT is running, as the boot stage reports it.
+///
+/// The boot stage checks the signature of the image it starts and reads
+/// the SVN from the signed header, so the SVN here comes from a checked
+/// image. [`trial_outcome`] compares that SVN with the session SVN.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RunningImage {
+    /// Which image the boot stage started.
+    pub selected: BootSelection,
+    /// The SVN of the running image. `None` when the platform cannot report
+    /// the SVN. [`trial_outcome`] then reads every session in flight as
+    /// unconfirmed, because the platform read no SVN to compare with the
+    /// session SVN.
+    pub svn: Option<Svn>,
+}
+
+impl RunningImage {
+    /// The trial image is running, at `svn`.
+    #[must_use]
+    pub const fn trial(svn: Svn) -> Self {
+        Self {
+            selected: BootSelection::Trial,
+            svn: Some(svn),
+        }
+    }
+
+    /// The confirmed image is running, at `svn`.
+    #[must_use]
+    pub const fn confirmed(svn: Svn) -> Self {
+        Self {
+            selected: BootSelection::Confirmed,
+            svn: Some(svn),
+        }
+    }
+
+    /// Whether the boot stage reported `svn` as the SVN of the running
+    /// image. Compares the inner integers because `==` on `Svn` is not
+    /// usable in a const fn.
+    const fn runs_at(self, svn: Svn) -> bool {
+        matches!(self.svn, Some(running) if running.0 == svn.0)
+    }
 }
 
 /// Where the eRoT's own update session stands, as held in durable storage.
@@ -89,8 +140,9 @@ pub enum TrialOutcome {
     NoSession,
     /// A session exists that nothing will confirm: the trial booted and fell
     /// back, or it was never marked pending, or an image is running that the
-    /// session does not claim. All of them leave an update that has to be
-    /// dropped before another can start.
+    /// session does not claim, or the running image carries an SVN other
+    /// than the session SVN. In each case the caller has to revert the
+    /// session before another update can start.
     ///
     /// When the unclaimed trial is the image running right now, reverting
     /// only moves slot metadata: the part keeps running it until the next
@@ -111,10 +163,10 @@ pub enum TrialOutcome {
 ///
 /// Where the session lives (protected flash, a reserved region, a mock in
 /// tests) is the implementor's concern, as is how the platform marks the boot
-/// selector. A platform whose boot selector reads a record the eRoT writes
+/// stage. A platform whose boot stage reads a record the eRoT writes
 /// folds the pending mark into the session's own write, and its
 /// [`set_trial_pending`](Self::set_trial_pending) does nothing beyond moving
-/// the state. A platform whose boot selector is a register or a ROM-defined
+/// the state. A platform whose boot stage is a register or a ROM-defined
 /// table writes twice behind the seam. Neither shows here.
 ///
 /// # Transitions
@@ -144,10 +196,10 @@ pub enum TrialOutcome {
 ///
 /// # Boot bound
 ///
-/// A boot selector that holds the pending mark across resets boots the trial
+/// A boot stage that holds the pending mark across resets boots the trial
 /// again
 /// after every reset, so a trial image that dies before anything confirms it
-/// loops forever unless something counts attempts. A selector that consumes
+/// loops forever unless something counts attempts. A boot stage that consumes
 /// the mark does not have this problem: the second boot runs the confirmed
 /// image. Platforms in the first category need a ROM-side boot counter or
 /// equivalent bound on how many boots a trial gets.
@@ -170,16 +222,17 @@ pub trait SelfUpdate {
     /// The session as durable storage holds it.
     fn state(&self) -> Result<SelfUpdateState, Self::Error>;
 
-    /// Which image this boot is running.
+    /// Which image this boot is running, and at which SVN.
     ///
-    /// [`Confirmed`](RunningImage::Confirmed) whenever no trial is in flight,
-    /// an `Idle` session included: with nothing pending there is nothing else
-    /// to be running.
+    /// [`Confirmed`](BootSelection::Confirmed) whenever no trial is in
+    /// flight, an `Idle` session included: with nothing pending there is
+    /// nothing else to be running. The SVN is what the boot stage read
+    /// from the signed header of the image it started, handed over at boot;
+    /// `None` when the platform has no such handover.
     ///
-    /// Read together with [`state`](Self::state) once at boot, as one
-    /// snapshot. Nothing moves the pair in between: the eRoT is the only
-    /// writer and it is not running its own update while deciding the last
-    /// one.
+    /// Read together with [`state`](Self::state) once at boot, before
+    /// settlement writes the session, as one snapshot. The boot stage reports
+    /// one image per boot.
     fn running(&self) -> Result<RunningImage, Self::Error>;
 
     /// Records a new session with the verified SVN, leaving the state
@@ -228,31 +281,50 @@ pub trait SelfUpdate {
 /// What became of the trial, from the session and the image that booted.
 ///
 /// A session and a running image that disagree are not an error: they are the
-/// crash windows this function exists to name.
+/// crash windows this function exists to name. A trial is in progress only
+/// while the trial image runs at the SVN the session recorded, and a
+/// confirmed session commits only while the image at that SVN runs; any
+/// other SVN, or none, reads as unconfirmed.
 #[must_use]
 pub const fn trial_outcome(state: SelfUpdateState, running: RunningImage) -> TrialOutcome {
-    match (state, running) {
+    match (state, running.selected) {
         // Nothing in flight.
-        (SelfUpdateState::Idle, RunningImage::Confirmed) => TrialOutcome::NoSession,
+        (SelfUpdateState::Idle, BootSelection::Confirmed) => TrialOutcome::NoSession,
         // A trial image running with no session behind it: nothing records
         // what it was for, so nothing can confirm it.
-        (SelfUpdateState::Idle, RunningImage::Trial) => TrialOutcome::Unconfirmed,
+        (SelfUpdateState::Idle, BootSelection::Trial) => TrialOutcome::Unconfirmed,
         // Prepared, and the reset that would have started the trial never
         // came.
-        (SelfUpdateState::Prepared { .. }, RunningImage::Confirmed) => TrialOutcome::Unconfirmed,
+        (SelfUpdateState::Prepared { .. }, BootSelection::Confirmed) => TrialOutcome::Unconfirmed,
         // A trial booted while the session still reads Prepared: the mark
         // ran ahead of the record, the ordering rule's other side.
-        (SelfUpdateState::Prepared { .. }, RunningImage::Trial) => TrialOutcome::Unconfirmed,
-        // The trial is what is running now.
-        (SelfUpdateState::TrialPending { .. }, RunningImage::Trial) => TrialOutcome::InProgress,
+        (SelfUpdateState::Prepared { .. }, BootSelection::Trial) => TrialOutcome::Unconfirmed,
+        // The trial is what is running now, if it is the image the session
+        // recorded. A trial image at another SVN is one the session does
+        // not claim.
+        (SelfUpdateState::TrialPending { svn }, BootSelection::Trial) => {
+            if running.runs_at(svn) {
+                TrialOutcome::InProgress
+            } else {
+                TrialOutcome::Unconfirmed
+            }
+        }
         // The trial booted and the platform fell back, so the image either
         // failed or never reached the point that confirms it.
-        (SelfUpdateState::TrialPending { .. }, RunningImage::Confirmed) => {
+        (SelfUpdateState::TrialPending { .. }, BootSelection::Confirmed) => {
             TrialOutcome::Unconfirmed
         }
-        // Confirmed. The floor advance is the only step that may still be
-        // missing, and repeating it is harmless.
-        (SelfUpdateState::Committed { svn }, _) => TrialOutcome::ConfirmedUncommitted { svn },
+        // Confirmed, and the image at that SVN runs. The SVN floor advance
+        // is the only step that may still be missing, and repeating it is
+        // harmless.
+        (SelfUpdateState::Committed { svn }, _) if running.runs_at(svn) => {
+            TrialOutcome::ConfirmedUncommitted { svn }
+        }
+        // Confirmed, but an image at another SVN runs: the boot stage
+        // fell back after the confirm, or a writer with flash access
+        // replaced the session. Advancing the SVN floor to the session SVN
+        // would push the floor past the image that runs.
+        (SelfUpdateState::Committed { .. }, _) => TrialOutcome::Unconfirmed,
     }
 }
 
@@ -271,7 +343,12 @@ impl SelfUpdate for () {
     }
 
     fn running(&self) -> Result<RunningImage, Self::Error> {
-        Ok(RunningImage::Confirmed)
+        // `state` reads `Idle` on this board, and `trial_outcome` compares
+        // no SVN for an `Idle` session, so `running` reports none.
+        Ok(RunningImage {
+            selected: BootSelection::Confirmed,
+            svn: None,
+        })
     }
 
     fn prepare(&mut self, _svn: Svn) -> Result<(), Self::Error> {
@@ -340,7 +417,7 @@ mod tests {
         fn idle() -> Self {
             Self {
                 state: Cell::new(SelfUpdateState::Idle),
-                running: Cell::new(RunningImage::Confirmed),
+                running: Cell::new(RunningImage::confirmed(OLD)),
                 fail: false,
             }
         }
@@ -348,14 +425,16 @@ mod tests {
         fn faulty() -> Self {
             Self {
                 state: Cell::new(SelfUpdateState::Idle),
-                running: Cell::new(RunningImage::Confirmed),
+                running: Cell::new(RunningImage::confirmed(OLD)),
                 fail: true,
             }
         }
 
-        /// Stands in for the reset that boots what `set_trial_pending` marked.
-        fn reboot_into_the_trial(&self) {
-            self.running.set(RunningImage::Trial);
+        /// Stands in for the reset that boots what `set_trial_pending`
+        /// marked: the boot stage starts the trial image and reports the
+        /// SVN it read from that image.
+        fn reboot_into_the_trial(&self, svn: Svn) {
+            self.running.set(RunningImage::trial(svn));
         }
     }
 
@@ -432,6 +511,8 @@ mod tests {
         }
     }
 
+    /// The SVN of the image the eRoT ran before the update.
+    const OLD: Svn = Svn(3);
     const SVN: Svn = Svn(7);
     const NEWER: Svn = Svn(9);
 
@@ -445,7 +526,7 @@ mod tests {
             session.state(),
             Ok(SelfUpdateState::TrialPending { svn: SVN })
         );
-        session.reboot_into_the_trial();
+        session.reboot_into_the_trial(SVN);
         assert_eq!(
             trial_outcome(
                 session.state().expect("store answers"),
@@ -545,7 +626,19 @@ mod tests {
     #[test]
     fn reports_no_session_when_nothing_is_in_flight() {
         assert_eq!(
-            trial_outcome(SelfUpdateState::Idle, RunningImage::Confirmed),
+            trial_outcome(SelfUpdateState::Idle, RunningImage::confirmed(OLD)),
+            TrialOutcome::NoSession
+        );
+    }
+
+    /// A board with no session reports no SVN either, and `trial_outcome`
+    /// still reads the boot as nothing in flight.
+    #[test]
+    fn reports_no_session_without_a_running_svn() {
+        let running = ().running().expect("the no-session board answers");
+        assert_eq!(running.svn, None);
+        assert_eq!(
+            trial_outcome(SelfUpdateState::Idle, running),
             TrialOutcome::NoSession
         );
     }
@@ -555,7 +648,7 @@ mod tests {
     #[test]
     fn reports_a_trial_image_with_no_session_unconfirmed() {
         assert_eq!(
-            trial_outcome(SelfUpdateState::Idle, RunningImage::Trial),
+            trial_outcome(SelfUpdateState::Idle, RunningImage::trial(SVN)),
             TrialOutcome::Unconfirmed
         );
     }
@@ -567,7 +660,7 @@ mod tests {
         assert_eq!(
             trial_outcome(
                 SelfUpdateState::Prepared { svn: SVN },
-                RunningImage::Confirmed
+                RunningImage::confirmed(OLD)
             ),
             TrialOutcome::Unconfirmed
         );
@@ -578,21 +671,53 @@ mod tests {
     #[test]
     fn reports_a_trial_ahead_of_its_session_unconfirmed() {
         assert_eq!(
-            trial_outcome(SelfUpdateState::Prepared { svn: SVN }, RunningImage::Trial),
+            trial_outcome(
+                SelfUpdateState::Prepared { svn: SVN },
+                RunningImage::trial(SVN)
+            ),
             TrialOutcome::Unconfirmed
         );
     }
 
-    /// The boot that is running is the trial itself, on a selector that
+    /// The boot that is running is the trial itself, on a boot stage that
     /// consumes the pending mark and on one that holds it alike.
     #[test]
     fn reports_the_running_trial_in_progress() {
         assert_eq!(
             trial_outcome(
                 SelfUpdateState::TrialPending { svn: SVN },
-                RunningImage::Trial
+                RunningImage::trial(SVN)
             ),
             TrialOutcome::InProgress
+        );
+    }
+
+    /// The trial image runs, but at an SVN the session never recorded: a
+    /// writer with flash access replaced the session, or the boot stage
+    /// started an image the eRoT did not stage. The session does not claim
+    /// that image, so `trial_outcome` reads the session as unconfirmed.
+    #[test]
+    fn reports_a_trial_at_another_svn_unconfirmed() {
+        assert_eq!(
+            trial_outcome(
+                SelfUpdateState::TrialPending { svn: SVN },
+                RunningImage::trial(NEWER)
+            ),
+            TrialOutcome::Unconfirmed
+        );
+    }
+
+    /// A platform that reports no SVN cannot have its trial confirmed: no
+    /// SVN equals the session SVN, so the session reads as unconfirmed.
+    #[test]
+    fn reports_a_trial_without_a_running_svn_unconfirmed() {
+        let running = RunningImage {
+            selected: BootSelection::Trial,
+            svn: None,
+        };
+        assert_eq!(
+            trial_outcome(SelfUpdateState::TrialPending { svn: SVN }, running),
+            TrialOutcome::Unconfirmed
         );
     }
 
@@ -602,7 +727,7 @@ mod tests {
         assert_eq!(
             trial_outcome(
                 SelfUpdateState::TrialPending { svn: SVN },
-                RunningImage::Confirmed
+                RunningImage::confirmed(OLD)
             ),
             TrialOutcome::Unconfirmed
         );
@@ -610,13 +735,49 @@ mod tests {
 
     /// Crashed between `confirm` and the floor advance: the one case that
     /// commits rather than drops, and the reason the session carries a state
-    /// and not only an SVN.
+    /// and not only an SVN. The image at the session SVN runs whether the
+    /// boot stage still calls it the trial or already calls it
+    /// confirmed. An image other than the trial image, at the same SVN,
+    /// reads the same way; the SVN floor advance then lands on the SVN that
+    /// runs.
     #[test]
     fn reports_a_confirmed_trial_whose_floor_is_unmoved() {
-        for running in [RunningImage::Trial, RunningImage::Confirmed] {
+        for running in [RunningImage::trial(SVN), RunningImage::confirmed(SVN)] {
             assert_eq!(
                 trial_outcome(SelfUpdateState::Committed { svn: SVN }, running),
                 TrialOutcome::ConfirmedUncommitted { svn: SVN }
+            );
+        }
+    }
+
+    /// Confirmed, but the image that runs carries the old SVN: the boot
+    /// stage fell back after the confirm. Committing would advance the
+    /// SVN floor past the image that runs, so the session reads as
+    /// unconfirmed.
+    #[test]
+    fn reports_a_confirmed_trial_the_boot_stage_fell_back_from_unconfirmed() {
+        assert_eq!(
+            trial_outcome(
+                SelfUpdateState::Committed { svn: SVN },
+                RunningImage::confirmed(OLD)
+            ),
+            TrialOutcome::Unconfirmed
+        );
+    }
+
+    /// Confirmed, but the platform reports no running SVN, whichever image
+    /// the boot stage says it started: a platform that cannot say what
+    /// runs cannot commit an SVN floor advance.
+    #[test]
+    fn reports_a_confirmed_trial_without_a_running_svn_unconfirmed() {
+        for selected in [BootSelection::Trial, BootSelection::Confirmed] {
+            let running = RunningImage {
+                selected,
+                svn: None,
+            };
+            assert_eq!(
+                trial_outcome(SelfUpdateState::Committed { svn: SVN }, running),
+                TrialOutcome::Unconfirmed
             );
         }
     }

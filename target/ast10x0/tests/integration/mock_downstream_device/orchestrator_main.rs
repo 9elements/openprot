@@ -51,9 +51,9 @@ use orchestrator_capabilities::AuthenticatedImage;
 #[cfg(measured)]
 use orchestrator_capabilities::Measurement;
 use orchestrator_capabilities::{
-    BootControl, BootStatus, EvidenceReader, IncrementalVerifier, PollOutcome, RunningImage,
-    SelfUpdate, SelfUpdateState, StageProgress, Svn, SvnFloor, Updatable, UpdateError,
-    VerifySession,
+    BootControl, BootSelection, BootStatus, EvidenceReader, IncrementalVerifier, PollOutcome,
+    RunningImage, SelfUpdate, SelfUpdateState, StageProgress, Svn, SvnFloor, Updatable,
+    UpdateError, VerifySession,
 };
 #[cfg(self_update)]
 use orchestrator_capabilities::{Progress, SelfReset};
@@ -406,13 +406,20 @@ impl SelfUpdate for SelfSession {
     }
 
     fn running(&self) -> Result<RunningImage, BoardFault> {
-        // Which image this boot runs is the boot selector's answer, not the
-        // session's. Here it is the scenario's: a self-trial build is the
-        // boot that runs the trial image.
+        // The boot stage, not the session, answers which image this
+        // boot runs and at which SVN. Here the scenario answers: a
+        // self-trial build is the boot that runs the trial image, at the
+        // SVN `install` recorded for the session. Every other build boots
+        // the image that was there before any session, and the scenario
+        // never compares that image with a session, so `running` reports
+        // no SVN.
         Ok(if EXPECT_SELF_TRIAL {
-            RunningImage::Trial
+            RunningImage::trial(TRIAL_SVN)
         } else {
-            RunningImage::Confirmed
+            RunningImage {
+                selected: BootSelection::Confirmed,
+                svn: None,
+            }
         })
     }
 
