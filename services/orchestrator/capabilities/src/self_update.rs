@@ -224,11 +224,13 @@ pub trait SelfUpdate {
 
     /// Which image this boot is running, and at which SVN.
     ///
-    /// [`Confirmed`](BootSelection::Confirmed) whenever no trial is in
-    /// flight, an `Idle` session included: with nothing pending there is
-    /// nothing else to be running. The SVN is what the boot stage read
-    /// from the signed header of the image it started, handed over at boot;
-    /// `None` when the platform has no such handover.
+    /// [`Trial`](BootSelection::Trial) when the boot stage started the image
+    /// of a session in flight, [`Confirmed`](BootSelection::Confirmed) for
+    /// any other image. The answer holds for the whole boot: a confirm, a
+    /// revert or a complete during the boot changes the session, not the
+    /// running image. The SVN is what the boot stage read from the signed
+    /// header of the image it started, handed over at boot; `None` when the
+    /// platform has no such handover.
     ///
     /// Read together with [`state`](Self::state) once at boot, before
     /// settlement writes the session, as one snapshot. The boot stage reports

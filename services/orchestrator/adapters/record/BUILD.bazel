@@ -1,0 +1,51 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# The record, the tried mark, the handover and the slot choice. No
+# dependencies, so a boot stage outside the orchestrator links it too.
+rust_library(
+    name = "orchestrator_self_update_format",
+    srcs = [
+        "format/crc32.rs",
+        "format/lib.rs",
+        "format/mark.rs",
+        "format/record.rs",
+        "format/select.rs",
+    ],
+    crate_root = "format/lib.rs",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+# Host tests: build on the host platform, no kernel/QEMU.
+rust_test(
+    name = "orchestrator_self_update_format_test",
+    crate = ":orchestrator_self_update_format",
+)
+
+# `SelfUpdate` over the record on `util_io::Storage`.
+rust_library(
+    name = "orchestrator_self_update_record",
+    srcs = [
+        "src/lib.rs",
+        "src/session.rs",
+        "src/tests.rs",
+    ],
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":orchestrator_self_update_format",
+        "//services/orchestrator/capabilities:orchestrator_capabilities",
+        "//services/orchestrator/config:orchestrator_config",
+        "//util/io",
+    ],
+)
+
+# Host tests: build on the host platform, no kernel/QEMU.
+rust_test(
+    name = "orchestrator_self_update_record_test",
+    crate = ":orchestrator_self_update_record",
+)
