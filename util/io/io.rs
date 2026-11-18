@@ -5,6 +5,10 @@
 
 #![no_std]
 
+mod byte_source;
+
+pub use byte_source::{ByteReadError, ByteSource};
+
 use util_error::{ErrorCode, ErrorModule};
 
 /// The generic IO error module.
