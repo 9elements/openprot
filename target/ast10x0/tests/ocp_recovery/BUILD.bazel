@@ -1,0 +1,136 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+load("@pigweed//pw_kernel/tooling:rust_app.bzl", "rust_app")
+load("@pigweed//pw_kernel/tooling:system_image.bzl", "system_image")
+load("@pigweed//pw_kernel/tooling:target_codegen.bzl", "target_codegen")
+load("@pigweed//pw_kernel/tooling:target_linker_script.bzl", "target_linker_script")
+load("@pigweed//pw_kernel/tooling/panic_detector:rust_binary_no_panics_test.bzl", "rust_binary_no_panics_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+load("//target/ast10x0:defs.bzl", "TARGET_COMPATIBLE_WITH", "flash_system_image_test")
+
+filegroup(
+    name = "system_config",
+    srcs = ["system.json5"],
+    visibility = ["//visibility:public"],
+)
+
+target_codegen(
+    name = "codegen",
+    arch = "@pigweed//pw_kernel/arch/arm_cortex_m:arch_arm_cortex_m",
+    system_config = ":system_config",
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+)
+
+target_linker_script(
+    name = "linker_script",
+    system_config = ":system_config",
+    tags = ["kernel"],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    template = "//target/ast10x0:linker_script_template",
+)
+
+rust_binary(
+    name = "target",
+    srcs = ["target.rs"],
+    edition = "2024",
+    tags = ["kernel"],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":codegen",
+        ":linker_script",
+        "//target/ast10x0:entry",
+        "//target/ast10x0/peripherals",
+        "@pigweed//pw_kernel/arch/arm_cortex_m:arch_arm_cortex_m",
+        "@pigweed//pw_kernel/kernel",
+        "@pigweed//pw_kernel/subsys/console:console_backend",
+        "@pigweed//pw_kernel/target:target_common",
+        "@pigweed//pw_kernel/userspace",
+    ],
+)
+
+rust_library(
+    name = "proto",
+    srcs = ["proto.rs"],
+    crate_name = "ocp_recovery_test_proto",
+    edition = "2024",
+    tags = ["kernel"],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+)
+
+# The serving side: the register file, a slot that holds 1 push, and a
+# Recovery Agent stand-in in place of the transport. No flash dependency.
+rust_app(
+    name = "ocp_device_app",
+    srcs = ["device_main.rs"],
+    codegen_crate_name = "app_ocp_device",
+    edition = "2024",
+    tags = ["kernel"],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":proto",
+        "//services/ocp-recovery/api:ocp_recovery_api",
+        "//services/ocp-recovery/server:ocp_recovery_server",
+        "//util/ipc",
+        "@pigweed//pw_kernel/userspace",
+        "@pigweed//pw_log/rust:pw_log",
+        "@pigweed//pw_status/rust:pw_status",
+    ],
+)
+
+# The recovery flow: takes the pushed bytes from the device app and writes
+# them to flash. No OCP recovery dependency.
+rust_app(
+    name = "ocp_flow_app",
+    srcs = ["flow_main.rs"],
+    codegen_crate_name = "app_ocp_flow",
+    edition = "2024",
+    tags = ["kernel"],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    deps = [
+        ":proto",
+        "//hal/blocking/flash",
+        "//services/flash/client-ipc:flash_client_ipc",
+        "//util/ipc",
+        "@pigweed//pw_kernel/userspace",
+        "@pigweed//pw_log/rust:pw_log",
+        "@pigweed//pw_status/rust:pw_status",
+    ],
+)
+
+system_image(
+    name = "ocp_recovery",
+    apps = [
+        "//target/ast10x0/tests/flash_service:flash_server_bin",
+        ":ocp_device_app",
+        ":ocp_flow_app",
+    ],
+    kernel = ":target",
+    platform = "//target/ast10x0",
+    system_config = ":system_config",
+    tags = ["kernel"],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    visibility = ["//visibility:public"],
+)
+
+# The runner seeds 64 MiB erased images on both FMC chip selects, as the
+# flash_service test does. The flash service binds CS1, where the pushed
+# image lands.
+#   bazelisk test --config=virt_ast10x0 //target/ast10x0/tests/ocp_recovery:ocp_recovery_qemu_test
+flash_system_image_test(
+    name = "ocp_recovery_qemu_test",
+    cs0_image = "cs0.img",
+    cs1_image = "cs1.img",
+    flash_size = 64 * 1024 * 1024,
+    fmc_model = "w25q512jv",
+    image = ":ocp_recovery",
+    tags = ["qemu_only"],
+    target_compatible_with = TARGET_COMPATIBLE_WITH,
+    visibility = ["//visibility:public"],
+)
+
+rust_binary_no_panics_test(
+    name = "no_panics_test",
+    binary = ":ocp_recovery",
+    tags = ["kernel"],
+)

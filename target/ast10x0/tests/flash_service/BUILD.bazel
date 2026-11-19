@@ -56,6 +56,8 @@ rust_app(
     edition = "2024",
     tags = ["kernel"],
     target_compatible_with = TARGET_COMPATIBLE_WITH,
+    # The OCP recovery test image runs the same flash server.
+    visibility = ["//target/ast10x0/tests/ocp_recovery:__pkg__"],
     deps = [
         "//hal/blocking/flash",
         "//hal/blocking/flash:driver",

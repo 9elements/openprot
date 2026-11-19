@@ -1,0 +1,133 @@
+// Licensed under the Apache-2.0 license
+// SPDX-License-Identifier: Apache-2.0
+
+// AST10x0 OCP recovery test configuration
+// ARM Cortex-M4 with 768KB SRAM (0x00000000 - 0x000BFFFF). The AST10x0 has no
+// XIP: firmware executes from RAM.
+//
+// Memory layout (the flash_service layout with the app flash filled):
+//   0x00000000 - 0x00000500: Vector table (1280 bytes)
+//   0x00000500 - 0x00020000: Kernel code (~126KB)
+//   0x00020000 - 0x00040000: Flash server app flash (128KB)
+//   0x00040000 - 0x00050000: OCP device app flash (64KB)
+//   0x00050000 - 0x00060000: OCP flow app flash (64KB)
+//   0x00060000 - 0x00080000: Kernel RAM (128KB)
+//   0x00080000 - 0x00090000: Flash server RAM (64KB)
+//   0x00090000 - 0x00098000: OCP device RAM (32KB)
+//   0x00098000 - 0x000A0000: OCP flow RAM (32KB)
+{
+    arch: {
+        type: "armv7m",
+        vector_table_start_address: 0x00000000,
+        vector_table_size_bytes: 1280,  // 0x500
+    },
+    kernel: {
+        flash_start_address: 0x00000500,  // After vector table
+        flash_size_bytes: 129792,         // ~126KB (ends at 0x00020000)
+        ram_start_address: 0x00060000,    // After all flash regions
+        ram_size_bytes: 131072,           // 128KB
+    },
+    apps: [
+        {
+            name: "flash_server_bin",
+            flash_size_bytes: 131072,     // 128KB for server code
+            processes: [
+                {
+                    name: "flash_server_process",
+                    ram_size_bytes: 65536,        // 64KB RAM (holds the 4KB+ IPC buffer)
+                    objects: [
+                        {
+                            name: "wg",
+                            type: "wait_group",
+                        },
+                        {
+                            name: "flash",
+                            type: "channel_handler",  // Server side of client→server channel
+                        },
+                        {
+                            type: "thread",
+                            name: "flash_server_thread",
+                            kernel_stack_size_bytes: 4096,  // 4KB stack
+                        },],
+                    memory_mappings: [
+                        // The kernel target applies the FMC pinctrl in main()
+                        // before any process starts, so the server does not
+                        // map the SCU.
+                        {
+                            // FMC controller registers.
+                            name: "fmc_regs",
+                            type: "device",
+                            start_address: 0x7e620000,
+                            size_bytes: 0x1000,
+                        },
+                        {
+                            // FMC CS0 memory-mapped flash read window (8 MiB).
+                            name: "fmc_cs0_window",
+                            type: "device",
+                            start_address: 0x80000000,
+                            size_bytes: 0x800000,
+                        },
+                        {
+                            // FMC CS1 memory-mapped flash read window (64 MiB).
+                            // With both CS0 and CS1 present the 256 MiB FMC
+                            // aperture is split in half, relocating the served
+                            // CS1 window to 0x88000000.
+                            name: "fmc_cs1_window",
+                            type: "device",
+                            start_address: 0x88000000,
+                            size_bytes: 0x04000000,
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            name: "ocp_device_app",
+            flash_size_bytes: 65536,      // 64KB
+            processes: [
+                {
+                    name: "ocp_device_process",
+                    ram_size_bytes: 32768,        // 32KB RAM
+                    objects: [
+                        {
+                            name: "ocp",
+                            type: "channel_handler",  // The flow takes pushed bytes here
+                        },
+                        {
+                            type: "thread",
+                            name: "ocp_device_thread",
+                            kernel_stack_size_bytes: 4096,
+                        },],
+                },
+            ],
+        },
+        {
+            name: "ocp_flow_app",
+            flash_size_bytes: 65536,      // 64KB
+            processes: [
+                {
+                    name: "ocp_flow_process",
+                    ram_size_bytes: 32768,        // 32KB RAM
+                    objects: [
+                        {
+                            name: "flash",
+                            type: "channel_initiator",
+                            handler_process: "flash_server_process",
+                            handler_object_name: "flash",
+                        },
+                        {
+                            name: "ocp",
+                            type: "channel_initiator",
+                            handler_process: "ocp_device_process",
+                            handler_object_name: "ocp",
+                        },
+                        {
+                            type: "thread",
+                            name: "ocp_flow_thread",
+                            kernel_stack_size_bytes: 4096,
+                        },],
+                },
+            ],
+        },
+    ],
+}
