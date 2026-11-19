@@ -25,6 +25,6 @@ pub use checkpoint::BootCheckpoint;
 #[doc(inline)]
 pub use device::{assert_retry_reaches_every_image, DeviceConfig};
 #[doc(inline)]
-pub use layout::{Golden, ImageLayout, Region, Slot, SlotId};
+pub use layout::{Golden, ImageLayout, LayoutImage, Region, Slot, SlotId};
 #[doc(inline)]
 pub use record::{RecordId, RecordLayout, RecordRegion};

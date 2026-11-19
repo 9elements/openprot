@@ -225,6 +225,54 @@ impl ImageLayout {
     pub const fn image_count(&self) -> usize {
         self.slots.len() + self.golden.is_some() as usize
     }
+
+    /// The image recovery attempt `attempt` uses, or `None` once every
+    /// image has had its attempt.
+    ///
+    /// `attempt` is the count `Recovery::restore` receives, `0` on the first
+    /// try of a recovery cycle. Attempt `n` names slot `n` in declaration
+    /// order, and the attempt after the last slot names the golden image.
+    /// A board answers `SourceExhausted` for `None`, so the state machine
+    /// treats the component per its failure policy without waiting for the
+    /// retry cap.
+    ///
+    /// [`assert_retry_reaches_every_image`](crate::assert_retry_reaches_every_image)
+    /// compares the retry cap with [`image_count`](Self::image_count), and
+    /// `image_for_attempt` returns `None` from attempt `image_count` on.
+    #[must_use]
+    pub const fn image_for_attempt(&self, attempt: u8) -> Option<LayoutImage> {
+        let attempt = attempt as usize;
+        if attempt < self.slots.len() {
+            return Some(LayoutImage::Slot(self.slots[attempt]));
+        }
+        match self.golden {
+            Some(golden) if attempt == self.slots.len() => Some(LayoutImage::Golden(golden)),
+            _ => None,
+        }
+    }
+}
+
+/// One image of a layout, as [`ImageLayout::image_for_attempt`] names it.
+///
+/// `Slot` and `Golden` stay apart because a board may write a slot and must
+/// not write the golden image.
+#[derive(Debug, Clone, Copy)]
+pub enum LayoutImage {
+    /// A slot of the layout.
+    Slot(Slot),
+    /// The golden image, the last image of a recovery cycle.
+    Golden(Golden),
+}
+
+impl LayoutImage {
+    /// Where the image sits in the image store of the device.
+    #[must_use]
+    pub const fn region(&self) -> Region {
+        match self {
+            Self::Slot(slot) => slot.region(),
+            Self::Golden(golden) => golden.region(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -311,6 +359,73 @@ mod tests {
             layout.slots()[0].region().end(),
             layout.slots()[1].region().base()
         );
+    }
+
+    /// What `image_for_attempt` returns for an attempt, by slot id.
+    #[derive(Debug, PartialEq)]
+    enum Named {
+        Slot(u8),
+        Golden,
+        Exhausted,
+    }
+
+    fn named(layout: &ImageLayout, attempt: u8) -> Named {
+        match layout.image_for_attempt(attempt) {
+            Some(LayoutImage::Slot(slot)) => Named::Slot(slot.id().0),
+            Some(LayoutImage::Golden(_)) => Named::Golden,
+            None => Named::Exhausted,
+        }
+    }
+
+    #[test]
+    fn recovery_tries_every_slot_in_order_and_the_golden_image_last() {
+        assert_eq!(named(&LAYOUT, 0), Named::Slot(0));
+        assert_eq!(named(&LAYOUT, 1), Named::Slot(1));
+        assert_eq!(named(&LAYOUT, 2), Named::Golden);
+        assert_eq!(named(&LAYOUT, 3), Named::Exhausted);
+        assert_eq!(named(&LAYOUT, u8::MAX), Named::Exhausted);
+    }
+
+    #[test]
+    fn recovery_stops_after_the_last_slot_without_a_golden_image() {
+        let layout = ImageLayout::new(const { &[slot(0), slot(1)] }, None);
+        assert_eq!(named(&layout, 1), Named::Slot(1));
+        assert_eq!(named(&layout, 2), Named::Exhausted);
+    }
+
+    #[test]
+    fn recovery_starts_at_the_golden_image_when_the_layout_has_no_slot() {
+        let layout = ImageLayout::new(&[], Some(GOLDEN));
+        assert_eq!(named(&layout, 0), Named::Golden);
+        assert_eq!(named(&layout, 1), Named::Exhausted);
+    }
+
+    #[test]
+    fn the_golden_attempt_names_the_golden_region() {
+        // The attempt after the last slot.
+        let golden_attempt = LAYOUT.slots().len() as u8;
+        let image = LAYOUT.image_for_attempt(golden_attempt).unwrap();
+        assert_eq!(image.region().base(), GOLDEN.region().base());
+        assert_eq!(image.region().len(), GOLDEN.region().len());
+    }
+
+    /// The retry budget assert counts images with `image_count`, so the
+    /// attempts that name an image have to be exactly the attempts below it.
+    #[test]
+    fn an_attempt_names_an_image_exactly_when_it_is_below_the_image_count() {
+        for layout in [
+            LAYOUT,
+            ImageLayout::new(const { &[slot(0), slot(1)] }, None),
+            ImageLayout::new(&[], Some(GOLDEN)),
+        ] {
+            for attempt in 0..=u8::MAX {
+                assert_eq!(
+                    layout.image_for_attempt(attempt).is_some(),
+                    usize::from(attempt) < layout.image_count(),
+                    "attempt {attempt}"
+                );
+            }
+        }
     }
 
     /// A board with plain A/B slots carries no golden image.
