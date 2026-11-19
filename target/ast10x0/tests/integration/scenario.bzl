@@ -47,6 +47,8 @@ SCENARIO_CFGS = [
     "slot_resync",
     "recovery",
     "recovery_exhausted",
+    "recovery_golden",
+    "recovery_golden_corrupt",
 ]
 
 KERNEL_DEPS = [

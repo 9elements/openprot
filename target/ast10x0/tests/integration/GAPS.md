@@ -250,6 +250,28 @@ The corruption lands on the component under update. `Updating` preempts on
 a `Required` corruption of any component, including one the update is not
 touching, and that transition is untaken.
 
+## What the golden image scenario does not say
+
+`mock_downstream_device/recovery_golden` keeps the device image in flash,
+in a layout with a slot and a golden image. The verifier reads the
+selected image through the flash server, and `restore` selects the image
+`ImageLayout::image_for_attempt` names.
+
+- The scenario selects the golden image in place and copies no bytes.
+  Whether a board boots the golden image where it sits or copies it into
+  a slot first is undecided, and the `Slot` and `Golden` docs in
+  `services/orchestrator/config/src/layout.rs` still disagree on it.
+- The mock downstream device runs no image. The selection decides which
+  bytes the verifier reads, and no code checks that the device boots
+  from the region the board selected.
+- The selection is a static in RAM. No scenario resets the eRoT, so no
+  run shows which image the board selects after a reset.
+- The verifier compares bytes with a pattern and reports no SVN. No
+  scenario shows the golden image passing below the SVN floor that a
+  slot image has to meet.
+- The layout holds 1 slot. A layout with 2 slots, where attempt 1 names
+  a slot the verifier has not refused yet, has no scenario.
+
 ## Events no scenario can reach
 
 Checked by grepping the scenario apps for each `Event`, then asking what

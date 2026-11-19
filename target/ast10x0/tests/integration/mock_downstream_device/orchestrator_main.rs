@@ -28,10 +28,14 @@
 use core::convert::Infallible;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
-use board_stubs::{BoardFault, CountingLatch, StubImage};
+// `recovery_golden` reads the image from flash, every other build names
+// an image no code reads.
+#[cfg(not(recovery_golden))]
+use board_stubs::StubImage;
+use board_stubs::{BoardFault, CountingLatch};
 // The shared stub authenticates everything and measures nothing. The
 // `measured` and recovery cfgs wire a verifier of their own.
-#[cfg(not(any(measured, recovery, recovery_exhausted)))]
+#[cfg(not(any(measured, recovery, recovery_exhausted, recovery_golden)))]
 use board_stubs::StubVerifier;
 use openprot_orchestrator_driver::{
     bring_up, settle_self_update_at_boot, Board, BoardCapabilities, ComponentWiring, ErotUpdate,
@@ -65,6 +69,7 @@ use orchestrator_capabilities::{Recovery, RestoreOutcome};
 use orchestrator_checkpoint_walk::CheckpointWalk;
 use orchestrator_config::{
     assert_retry_reaches_every_image, chain_of, BootCheckpoint, ChainEntries, DeviceConfig,
+    ImageLayout,
 };
 use util_io::{ByteReadError, ByteSource};
 
@@ -92,10 +97,11 @@ const RUN_BUDGET_MILLIS: u64 = 10_000;
 
 /// Whether this build passes on a platform lock: the device never reports
 /// (`device_hangs`), or its image is refused with no source left
-/// (`recovery_exhausted`). Inverting the verdict here, rather than letting
-/// the target fail, keeps a build error and a caught failure from looking
-/// the same to the runner.
-const EXPECT_LOCKDOWN: bool = cfg!(device_hangs) || cfg!(recovery_exhausted);
+/// (`recovery_exhausted`, `recovery_golden_corrupt`). Inverting the verdict here,
+/// rather than letting the target fail, keeps a build error and a caught
+/// failure from looking the same to the runner.
+const EXPECT_LOCKDOWN: bool =
+    cfg!(device_hangs) || cfg!(recovery_exhausted) || cfg!(recovery_golden_corrupt);
 
 /// How many times this build expects the platform to latch. The runs that
 /// end in lockdown latch once, the runs that come up never do, which is
@@ -104,18 +110,28 @@ const EXPECT_LATCHES: u32 = EXPECT_LOCKDOWN as u32;
 
 /// Whether this build starts with an image the RoT refuses. `recovery`
 /// restores a good image and boots. `recovery_exhausted` restores an image
-/// the verifier still refuses, then runs out of sources.
-const EXPECT_RECOVERY: bool = cfg!(recovery) || cfg!(recovery_exhausted);
+/// the verifier still refuses, then runs out of sources. `recovery_golden`
+/// starts with a refused image in the slot and selects the golden image.
+const EXPECT_RECOVERY: bool = cfg!(recovery) || cfg!(recovery_exhausted) || cfg!(recovery_golden);
 
 /// Whether the expected lockdown happens inside the `PowerGood` dispatch.
-/// The verification, both restore calls and the gating are follow-ups of
+/// The verification, every restore call and the gating are follow-ups of
 /// `PowerGood`, so the state machine is already `Locked` when that
 /// dispatch returns.
-const LOCKS_AT_POWER_ON: bool = cfg!(recovery_exhausted);
+const LOCKS_AT_POWER_ON: bool = cfg!(recovery_exhausted) || cfg!(recovery_golden_corrupt);
 
+/// How many times the run expects `restore` to be called: a call per
+/// image in the layout. Attempt 0 names the slot the verifier just
+/// refused, so that call changes no selection, and the last call selects
+/// the golden image. `recovery_golden_corrupt` adds the call that finds no
+/// image left.
+#[cfg(recovery_golden)]
+const EXPECT_RESTORE_CALLS: u8 =
+    golden::LAYOUT.image_count() as u8 + cfg!(recovery_golden_corrupt) as u8;
 /// How many times the run expects `restore` to be called. `recovery`
 /// needs one. `recovery_exhausted` needs two: the first writes an image
 /// the verifier still refuses, the second answers `SourceExhausted`.
+#[cfg(not(recovery_golden))]
 const EXPECT_RESTORE_CALLS: u8 = if cfg!(recovery_exhausted) {
     2
 } else if cfg!(recovery) {
@@ -167,6 +183,14 @@ const EXPECT_SETTLEMENT: SelfUpdateSettlement = if EXPECT_SELF_TRIAL {
 const RESET_ASSERT: u8 = 0;
 const RESET_RELEASE: u8 = 1;
 
+/// The images of the managed device. A boot walk never looks at images, so
+/// `None` is legal. `recovery_golden` reads the image from flash and
+/// declares where the slot and the golden image sit.
+#[cfg(not(recovery_golden))]
+const DOWNSTREAM_LAYOUT: Option<ImageLayout> = None;
+#[cfg(recovery_golden)]
+const DOWNSTREAM_LAYOUT: Option<ImageLayout> = Some(golden::LAYOUT);
+
 /// The device table. One checkpoint: the device either reports ready inside
 /// the window or it does not. Probe 1 is what the evidence reader answers
 /// `Booted` for once the latch is set.
@@ -184,8 +208,7 @@ static DEVICES: [DeviceConfig<u8, u8>; 2] = [
             1,
             core::time::Duration::from_millis(BOOT_WINDOW_MILLIS),
         )],
-        // A boot walk never looks at images, so no layout is legal here.
-        None,
+        DOWNSTREAM_LAYOUT,
         ComponentAttrs::passive_required(),
     ),
 ];
@@ -280,18 +303,22 @@ impl Verifier for LatchedVerifier {
 /// The verifier this scenario wires: the shared stub, unless the build
 /// needs a verifier that refuses (the recovery cfgs) or one that measures
 /// (`measured`).
-#[cfg(not(any(measured, recovery, recovery_exhausted)))]
+#[cfg(not(any(measured, recovery, recovery_exhausted, recovery_golden)))]
 type ScenarioVerifier = StubVerifier;
 #[cfg(any(recovery, recovery_exhausted))]
 type ScenarioVerifier = LatchedVerifier;
+#[cfg(recovery_golden)]
+type ScenarioVerifier = golden::FlashVerifier;
 #[cfg(measured)]
 type ScenarioVerifier = MeasuringVerifier;
 
 /// The `ScenarioVerifier` the board is built with.
-#[cfg(not(any(measured, recovery, recovery_exhausted)))]
+#[cfg(not(any(measured, recovery, recovery_exhausted, recovery_golden)))]
 const SCENARIO_VERIFIER: ScenarioVerifier = StubVerifier;
 #[cfg(any(recovery, recovery_exhausted))]
 const SCENARIO_VERIFIER: ScenarioVerifier = LatchedVerifier;
+#[cfg(recovery_golden)]
+const SCENARIO_VERIFIER: ScenarioVerifier = golden::FlashVerifier;
 #[cfg(measured)]
 const SCENARIO_VERIFIER: ScenarioVerifier = MeasuringVerifier;
 
@@ -302,16 +329,20 @@ static RESTORE_CALLS: AtomicU8 = AtomicU8::new(0);
 /// Only the recovery cfgs wire a restore source. The rest keep `()`,
 /// which answers `SourceExhausted` at once, so `device_hangs` still locks
 /// instead of restoring.
-#[cfg(not(any(recovery, recovery_exhausted)))]
+#[cfg(not(any(recovery, recovery_exhausted, recovery_golden)))]
 type DeviceRecovery = ();
 #[cfg(any(recovery, recovery_exhausted))]
 type DeviceRecovery = RecoverySource;
+#[cfg(recovery_golden)]
+type DeviceRecovery = golden::ImageSelection;
 
 /// The `DeviceRecovery` each component is built with.
-#[cfg(not(any(recovery, recovery_exhausted)))]
+#[cfg(not(any(recovery, recovery_exhausted, recovery_golden)))]
 const DEVICE_RECOVERY: DeviceRecovery = ();
 #[cfg(any(recovery, recovery_exhausted))]
 const DEVICE_RECOVERY: DeviceRecovery = RecoverySource;
+#[cfg(recovery_golden)]
+const DEVICE_RECOVERY: DeviceRecovery = golden::ImageSelection;
 
 /// The device's one recovery source: it writes an image over the active
 /// image, and a second attempt answers `SourceExhausted`. The re-walk judges
@@ -333,6 +364,163 @@ impl Recovery for RecoverySource {
         pw_log::info!("restoring the device's image from its recovery source");
         IMAGE_GOOD.store(cfg!(recovery), Ordering::Relaxed);
         Ok(RestoreOutcome::Restored)
+    }
+}
+
+/// The device image in flash, in a layout with a slot and a golden image.
+///
+/// The verifier reads the bytes of the selected image through the flash
+/// server. `restore` selects the image `ImageLayout::image_for_attempt`
+/// names and writes no flash, so the golden region holds after the run
+/// what the build wrote into it. The mock downstream device runs no image,
+/// so the selection decides only which bytes the verifier reads.
+#[cfg(recovery_golden)]
+mod golden {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use app_orchestrator::handle;
+    use board_stubs::BoardFault;
+    use hal_flash::{Flash, FlashAddress};
+    use openprot_orchestrator_driver::{ImageSource, Verdict, Verifier};
+    use openprot_orchestrator_sm::ComponentId;
+    use orchestrator_capabilities::{AuthenticatedImage, Recovery, RestoreOutcome};
+    use orchestrator_config::{Golden, ImageLayout, Region, Slot, SlotId};
+    use services_flash_client::FlashIpcClient;
+    use util_ipc::IpcHandle;
+
+    /// One 4 KiB sector per image. `SLOT_0` and `GOLDEN_REGION` in
+    /// recovery_golden/apps.bzl repeat the regions of the slot and the
+    /// golden image for the build of the flash image.
+    const REGION_LEN: u32 = 0x1000;
+    const SLOT: Slot = Slot::new(SlotId(0), Region::new(0x0010_0000, REGION_LEN));
+    const GOLDEN: Golden = Golden::new(Region::new(0x0020_0000, REGION_LEN));
+
+    pub const LAYOUT: ImageLayout = ImageLayout::new(const { &[SLOT] }, Some(GOLDEN));
+
+    /// The image length `SIZE` in recovery_golden/make_payload.py writes.
+    const IMAGE_LEN: usize = 1024;
+
+    /// How many image bytes the verifier reads per flash request.
+    const CHUNK_LEN: usize = 256;
+
+    /// The byte a good image holds at `offset`. make_payload.py repeats
+    /// the rule on the host.
+    fn expected_byte(offset: usize) -> u8 {
+        (offset % 251) as u8
+    }
+
+    /// The base of the region the device would boot from. Starts at the
+    /// slot, and `restore` moves it.
+    static SELECTED_BASE: AtomicU32 = AtomicU32::new(SLOT.region().base());
+
+    /// Whether the board selected the golden image by the end of the run.
+    pub fn golden_selected() -> bool {
+        SELECTED_BASE.load(Ordering::Relaxed) == GOLDEN.region().base()
+    }
+
+    /// The selected image, read through the flash server.
+    pub struct SelectedImage {
+        /// `None` until `open`, which is where an `ImageSource` claims
+        /// the flash. The eRoT entry holds an image no code opens, so
+        /// that entry sends the flash server no request.
+        flash: Option<FlashIpcClient>,
+    }
+
+    impl SelectedImage {
+        pub const fn new() -> Self {
+            Self { flash: None }
+        }
+    }
+
+    impl ImageSource for SelectedImage {
+        type Error = BoardFault;
+
+        fn open(&mut self) -> Result<(), BoardFault> {
+            if self.flash.is_none() {
+                let flash =
+                    FlashIpcClient::new(IpcHandle::new(handle::FLASH)).map_err(|_| BoardFault)?;
+                self.flash = Some(flash);
+            }
+            Ok(())
+        }
+
+        fn size(&self) -> Result<usize, BoardFault> {
+            Ok(IMAGE_LEN)
+        }
+
+        fn read_at(&mut self, offset: usize, buf: &mut [u8]) -> Result<(), BoardFault> {
+            let end = offset.checked_add(buf.len()).ok_or(BoardFault)?;
+            if end > IMAGE_LEN {
+                return Err(BoardFault);
+            }
+            let flash = self.flash.as_mut().ok_or(BoardFault)?;
+            let base = SELECTED_BASE.load(Ordering::Relaxed);
+            flash
+                .read(FlashAddress::new(base + offset as u32), buf)
+                .map_err(|_| BoardFault)
+        }
+    }
+
+    /// Replaces the shared stub, which authenticates without reading.
+    /// Compares every byte of the image with `expected_byte`. The walk
+    /// skips the eRoT, so only the managed device is verified.
+    pub struct FlashVerifier;
+
+    impl Verifier for FlashVerifier {
+        type Error = BoardFault;
+
+        fn verify(
+            &mut self,
+            _id: ComponentId,
+            image: &mut impl ImageSource,
+        ) -> Result<Verdict, BoardFault> {
+            image.open().map_err(|_| BoardFault)?;
+            let len = image.size().map_err(|_| BoardFault)?;
+            let mut chunk = [0u8; CHUNK_LEN];
+            let mut offset = 0;
+            while offset < len {
+                let wanted = (len - offset).min(CHUNK_LEN);
+                let part = chunk.get_mut(..wanted).ok_or(BoardFault)?;
+                image.read_at(offset, part).map_err(|_| BoardFault)?;
+                let good = part
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &byte)| byte == expected_byte(offset + i));
+                if !good {
+                    let base = SELECTED_BASE.load(Ordering::Relaxed);
+                    pw_log::info!("the verifier refuses the image at {:08x}", base as u32);
+                    return Ok(Verdict::Rejected);
+                }
+                offset += wanted;
+            }
+            Ok(Verdict::Authenticated(AuthenticatedImage {
+                // Like the shared stub: no manifest for an SVN, no engine
+                // to measure with.
+                svn: None,
+                measurement: None,
+            }))
+        }
+    }
+
+    /// Selects the image the layout names for the attempt. Attempt 0
+    /// names the slot the verifier just refused, so the first call
+    /// changes no selection and the re-walk refuses the slot again.
+    pub struct ImageSelection;
+
+    impl Recovery for ImageSelection {
+        type Error = BoardFault;
+
+        fn restore(&mut self, attempt: u8) -> Result<RestoreOutcome, BoardFault> {
+            super::RESTORE_CALLS.fetch_add(1, Ordering::Relaxed);
+            let Some(image) = LAYOUT.image_for_attempt(attempt) else {
+                pw_log::info!("no image left to select for the device");
+                return Ok(RestoreOutcome::SourceExhausted);
+            };
+            let base = image.region().base();
+            pw_log::info!("selecting the device image at {:08x}", base as u32);
+            SELECTED_BASE.store(base, Ordering::Relaxed);
+            Ok(RestoreOutcome::Restored)
+        }
     }
 }
 
@@ -820,10 +1008,26 @@ const SCENARIO_UPDATE_VERIFIER: ScenarioUpdateVerifier = NeverVerifier;
 #[cfg(not(self_update))]
 const SCENARIO_SELF_RESET: ScenarioSelfReset = ();
 
+/// The image each component names. `recovery_golden` reads the selected
+/// image from flash. Every other build names an image no code reads.
+#[cfg(not(recovery_golden))]
+type ScenarioImage = StubImage;
+#[cfg(recovery_golden)]
+type ScenarioImage = golden::SelectedImage;
+
+#[cfg(not(recovery_golden))]
+fn scenario_image() -> ScenarioImage {
+    StubImage
+}
+#[cfg(recovery_golden)]
+fn scenario_image() -> ScenarioImage {
+    golden::SelectedImage::new()
+}
+
 struct MockDownstreamDeviceBoard;
 
 impl BoardCapabilities for MockDownstreamDeviceBoard {
-    type Image = StubImage;
+    type Image = ScenarioImage;
     type Verifier = ScenarioVerifier;
     type BootControl = BmcReset;
     type BootWatch = CheckpointWalk<BmcEvidence, u8>;
@@ -851,7 +1055,7 @@ fn board() -> Board<MockDownstreamDeviceBoard, N> {
         // so index 0 still needs a value.
         components: core::array::from_fn(|i| ComponentWiring {
             device: &DEVICES[i],
-            image: StubImage,
+            image: scenario_image(),
             boot_control: BmcReset,
             boot_watch: CheckpointWalk::new(BmcEvidence, &DEVICES[i]),
             svn_floor: SvnFloorBinding::SelfManaged,
@@ -989,6 +1193,24 @@ fn restore_calls_as_expected() -> bool {
     false
 }
 
+/// Whether the last image the board selected is the golden image. In
+/// `recovery_golden_corrupt` a `restore` that stores no selection gives
+/// the same call count and the same lockdown, so this check reads the
+/// selection itself. Every build without `recovery_golden` has no
+/// selection to check.
+#[cfg(not(recovery_golden))]
+fn selection_as_expected() -> bool {
+    true
+}
+#[cfg(recovery_golden)]
+fn selection_as_expected() -> bool {
+    if golden::golden_selected() {
+        return true;
+    }
+    pw_log::error!("the board did not select the golden image");
+    false
+}
+
 /// Advances the eRoT SVN floor to the SVN the confirmed trial recorded,
 /// and closes the session.
 ///
@@ -1098,7 +1320,11 @@ fn run() -> Result<(), ()> {
                 pw_log::error!("orchestrator locked the platform");
                 return Err(());
             }
-            if !restore_calls_as_expected() || !measured_as_expected() || !latched_as_expected() {
+            if !restore_calls_as_expected()
+                || !selection_as_expected()
+                || !measured_as_expected()
+                || !latched_as_expected()
+            {
                 return Err(());
             }
             if EXPECT_RECOVERY {
@@ -1133,7 +1359,11 @@ fn run() -> Result<(), ()> {
             commit_self_floor(&mut core, &mut driver)?;
             // Without the call count, `recovery` would pass on a verifier
             // that never refused the image.
-            if !restore_calls_as_expected() || !measured_as_expected() || !latched_as_expected() {
+            if !restore_calls_as_expected()
+                || !selection_as_expected()
+                || !measured_as_expected()
+                || !latched_as_expected()
+            {
                 return Err(());
             }
             pw_log::info!("device booted and the orchestrator is in Ready");

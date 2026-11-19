@@ -1,0 +1,66 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+# The boot scenario with the device image in flash and a golden image.
+#
+# The layout holds a slot and a golden image. The slot holds an image the
+# verifier refuses, the golden region holds an image the verifier accepts. The
+# verifier reads the image bytes through the flash server. The run passes
+# when the board has selected the golden image, the device has booted, and
+# the runner finds the golden image as the build wrote it.
+
+load("//target/ast10x0/tests/integration:scenario.bzl", "qemu_scenario")
+load("//tools/flash_image:defs.bzl", "flash_image")
+load(":apps.bzl", "APPS", "FLASH", "FLASH_SIZE", "GOLDEN_OFFSET", "GOLDEN_REGION", "SLOT_0", "SYSTEM_CONFIG", "TARGET_DEPS", "TARGET_SRC")
+
+package(default_visibility = ["//target/ast10x0/tests/integration:__subpackages__"])
+
+filegroup(
+    name = "system_config",
+    srcs = ["system.json5"],
+)
+
+exports_files(["target.rs"])
+
+py_binary(
+    name = "make_payload",
+    srcs = ["make_payload.py"],
+)
+
+genrule(
+    name = "good_payload",
+    outs = ["good_payload.bin"],
+    cmd = "$(location :make_payload) good $@",
+    tools = [":make_payload"],
+)
+
+genrule(
+    name = "corrupt_payload",
+    outs = ["corrupt_payload.bin"],
+    cmd = "$(location :make_payload) corrupt $@",
+    tools = [":make_payload"],
+)
+
+flash_image(
+    name = "cs1_contents",
+    flash_size = FLASH_SIZE,
+    golden = ":good_payload",
+    golden_region = GOLDEN_REGION,
+    slots = {SLOT_0: ":corrupt_payload"},
+)
+
+# bazel test --config=virt_ast10x0 //target/ast10x0/tests/integration/mock_downstream_device/recovery_golden:recovery_golden_qemu_test
+qemu_scenario(
+    name = "recovery_golden_qemu",
+    apps = APPS,
+    cfgs = ["recovery_golden"],
+    flash = dict(
+        FLASH,
+        cs1_contents = ":cs1_contents",
+        cs1_expect = ":good_payload",
+        cs1_expect_offset = GOLDEN_OFFSET,
+    ),
+    system_config = SYSTEM_CONFIG,
+    target_deps = TARGET_DEPS,
+    target_src = TARGET_SRC,
+)

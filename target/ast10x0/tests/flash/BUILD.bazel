@@ -10,6 +10,12 @@ load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("//target/ast10x0:defs.bzl", "TARGET_COMPATIBLE_WITH", "flash_system_image_test")
 load("//util/region:defs.bzl", "app_regions")
 
+# The golden image scenario builds the server into the scenario image.
+exports_files(
+    ["server_main.rs"],
+    visibility = ["//target/ast10x0/tests/integration:__subpackages__"],
+)
+
 filegroup(
     name = "system_config",
     srcs = ["system.json5"],

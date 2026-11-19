@@ -1,0 +1,157 @@
+// Licensed under the Apache-2.0 license
+// SPDX-License-Identifier: Apache-2.0
+
+// AST10x0 golden image recovery QEMU test.
+//
+// The boot scenario in ../system.json5 with a flash server added:
+//
+//   orchestrator: drives the reset line, latches boot evidence, and reads
+//     the device image from flash through the flash server
+//   mock_downstream_device: the managed device, reacts to reset and reports ready
+//   flash_server: holds the FMC and serves the flash reads
+//
+// Memory map (AST10x0: 768 KB SRAM, no XIP, so code and data share it):
+//   0x00000000 - 0x00000500  vector table (1280 B)
+//   0x00000500 - 0x00020000  kernel flash (129792 B)
+//   0x00020000 - 0x00050000  app flash (3 x 64 KB)
+//   0x00060000 - 0x00080000  kernel RAM (128 KB)
+//   0x00080000 - 0x000A0000  app RAM (32 KB, 32 KB, 64 KB)
+//
+// ../system.json5 explains the kernel flash size and why the apps cannot
+// keep 128 KB each.
+{
+    arch: {
+        type: "armv7m",
+        vector_table_start_address: 0x00000000,
+        vector_table_size_bytes: 1280,
+    },
+    kernel: {
+        flash_start_address: 0x00000500,
+        flash_size_bytes: 129792,
+        ram_start_address: 0x00060000,
+        ram_size_bytes: 131072,
+    },
+    apps: [
+        {
+            name: "mock_downstream_device",
+            flash_size_bytes: 65536,
+            processes: [
+                {
+                    name: "mock_downstream_device_process",
+                    ram_size_bytes: 32768,
+                    objects: [
+                        {
+                            name: "wg",
+                            type: "wait_group",
+                        },
+                        {
+                            // Orchestrator -> device: assert or release reset.
+                            name: "reset_cmd",
+                            type: "channel_handler",
+                        },
+                        {
+                            // Device -> orchestrator: the ready line changed.
+                            name: "boot_evt",
+                            type: "channel_initiator",
+                            handler_process: "orchestrator_process",
+                            handler_object_name: "boot_evt",
+                        },
+                        {
+                            type: "thread",
+                            name: "mock_downstream_device_thread",
+                            kernel_stack_size_bytes: 4096,
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            name: "orchestrator",
+            flash_size_bytes: 65536,
+            processes: [
+                {
+                    name: "orchestrator_process",
+                    ram_size_bytes: 32768,
+                    objects: [
+                        {
+                            name: "wg",
+                            type: "wait_group",
+                        },
+                        {
+                            name: "boot_evt",
+                            type: "channel_handler",
+                        },
+                        {
+                            name: "reset_cmd",
+                            type: "channel_initiator",
+                            handler_process: "mock_downstream_device_process",
+                            handler_object_name: "reset_cmd",
+                        },
+                        {
+                            // Orchestrator -> flash server: read the image.
+                            name: "flash",
+                            type: "channel_initiator",
+                            handler_process: "flash_server_process",
+                            handler_object_name: "flash",
+                        },
+                        {
+                            type: "thread",
+                            name: "orchestrator_thread",
+                            kernel_stack_size_bytes: 4096,
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            name: "flash_server",
+            flash_size_bytes: 65536,
+            processes: [
+                {
+                    name: "flash_server_process",
+                    // Holds the IPC buffer of the server, 4 KB and a header.
+                    ram_size_bytes: 65536,
+                    objects: [
+                        {
+                            name: "flash",
+                            type: "channel_handler",
+                        },
+                        {
+                            type: "thread",
+                            name: "flash_server_thread",
+                            kernel_stack_size_bytes: 4096,
+                        },
+                    ],
+                    memory_mappings: [
+                        // The kernel applies the FMC pinmux before any
+                        // process starts, so the server does not map the SCU.
+                        {
+                            // FMC controller registers.
+                            name: "fmc_regs",
+                            type: "device",
+                            start_address: 0x7e620000,
+                            size_bytes: 0x1000,
+                        },
+                        {
+                            // FMC CS0 memory-mapped flash read window (8 MiB).
+                            name: "fmc_cs0_window",
+                            type: "device",
+                            start_address: 0x80000000,
+                            size_bytes: 0x800000,
+                        },
+                        {
+                            // FMC CS1 memory-mapped flash read window (64 MiB).
+                            // With CS0 and CS1 present the 256 MiB FMC
+                            // aperture splits in half, which puts the CS1
+                            // window at 0x88000000.
+                            name: "fmc_cs1_window",
+                            type: "device",
+                            start_address: 0x88000000,
+                            size_bytes: 0x04000000,
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+}

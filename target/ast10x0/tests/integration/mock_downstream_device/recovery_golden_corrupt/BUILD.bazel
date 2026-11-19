@@ -1,0 +1,41 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+# The negative case of the golden image scenario: the golden region holds an
+# image the verifier refuses too.
+#
+# Same sources, same system config, a second flag and another flash image.
+# The verifier refuses the slot and the golden image, and the next restore
+# call finds no image left. The device is required, so the platform reports
+# the component and locks. The run passes when the lockdown followed.
+
+load("//target/ast10x0/tests/integration:scenario.bzl", "qemu_scenario")
+load("//target/ast10x0/tests/integration/mock_downstream_device/recovery_golden:apps.bzl", "APPS", "CORRUPT_PAYLOAD", "FLASH", "FLASH_SIZE", "GOLDEN_OFFSET", "GOLDEN_REGION", "SLOT_0", "SYSTEM_CONFIG", "TARGET_DEPS", "TARGET_SRC")
+load("//tools/flash_image:defs.bzl", "flash_image")
+
+flash_image(
+    name = "cs1_contents",
+    flash_size = FLASH_SIZE,
+    golden = CORRUPT_PAYLOAD,
+    golden_region = GOLDEN_REGION,
+    slots = {SLOT_0: CORRUPT_PAYLOAD},
+)
+
+# bazel test --config=virt_ast10x0 //target/ast10x0/tests/integration/mock_downstream_device/recovery_golden_corrupt:recovery_golden_corrupt_qemu_test
+qemu_scenario(
+    name = "recovery_golden_corrupt_qemu",
+    apps = APPS,
+    cfgs = [
+        "recovery_golden",
+        "recovery_golden_corrupt",
+    ],
+    flash = dict(
+        FLASH,
+        cs1_contents = ":cs1_contents",
+        cs1_expect = CORRUPT_PAYLOAD,
+        cs1_expect_offset = GOLDEN_OFFSET,
+    ),
+    system_config = SYSTEM_CONFIG,
+    target_deps = TARGET_DEPS,
+    target_src = TARGET_SRC,
+)
