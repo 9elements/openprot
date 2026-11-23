@@ -1,0 +1,34 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# Test support: the Recovery Agent side of the FIFO push, for the host
+# tests and the QEMU test of the device side.
+rust_library(
+    name = "ocp_recovery_test_agent",
+    testonly = True,
+    srcs = ["src/lib.rs"],
+    crate_name = "openprot_ocp_recovery_test_agent",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//services/ocp-recovery/api:ocp_recovery_api",
+        "//util/io",
+        "@rust_crates//:zerocopy",
+    ],
+)
+
+# Host end-to-end: the push sequence against ocp_recovery_server::dispatch.
+# No kernel, no QEMU, no transport.
+rust_test(
+    name = "fifo_push_host_test",
+    srcs = ["tests/fifo_push_host.rs"],
+    edition = "2024",
+    deps = [
+        ":ocp_recovery_test_agent",
+        "//services/ocp-recovery/api:ocp_recovery_api",
+        "//services/ocp-recovery/server:ocp_recovery_server",
+        "//util/io",
+    ],
+)
