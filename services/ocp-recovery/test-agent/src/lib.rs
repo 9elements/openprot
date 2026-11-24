@@ -1,13 +1,14 @@
 // Licensed under the Apache-2.0 license
 // SPDX-License-Identifier: Apache-2.0
 
-//! A Recovery Agent for tests: the FIFO push of an image as a step function.
+//! A Recovery Agent for tests: the FIFO push of the images a device requests,
+//! as a step function.
 //!
 //! [`FifoPush::step`] makes at most 1 register access per call and never
 //! sleeps, so the same sequence runs in a host test and inside a kernel app.
 //! The caller decides how long to wait and when to give up: a step that finds
-//! the device not ready returns [`Progress::Waiting`] and makes the same
-//! access again on the next call.
+//! the device or the image source not ready returns [`Progress::Waiting`],
+//! and the next step reads the register of [`FifoPush::phase`].
 //!
 //! The writes and their order follow the BMC model of the Caliptra test
 //! benches: `RECOVERY_CTRL` 0, 0, 0 once the device reports recovery mode,
@@ -24,15 +25,26 @@
 //!   bus. `FifoPush` reads `INDIRECT_FIFO_CTRL` and `INDIRECT_FIFO_STATUS`
 //!   over the bus, as an agent without direct register access has to.
 //! - The Caliptra state machine ends when `DEVICE_STATUS` reports healthy or
-//!   running the recovery image. `FifoPush` ends on the end state of
-//!   `RECOVERY_STATUS`, which also names a failure.
+//!   running the recovery image. `FifoPush` ends on those states too after
+//!   an activation, and on healthy before the push.
+//!   `FifoPush` also ends on the end state of `RECOVERY_STATUS`, which can
+//!   name a failure, and on a `DEVICE_STATUS` of boot failure or fatal
+//!   error.
 //! - `FifoPush` requires the push and FIFO capability bits of `PROT_CAP`,
 //!   where the Caliptra state machine checks the device status bit alone.
 //! - `FifoPush` reads `DEVICE_STATUS` after every write, because a write
 //!   carries no answer and the protocol error is the only report of a
 //!   refused write.
-//! - The Caliptra state machine pushes the image of every index the device
-//!   requests. A `FifoPush` pushes 1 image.
+//!
+//! A device that boots from several images reports recovery mode again
+//! after an activation and names the next image index in `RECOVERY_STATUS`.
+//! [`FifoPush::with_source`] takes an [`ImageSource`] and pushes the image of
+//! every index the device requests. [`FifoPush::new`] pushes 1 image.
+//!
+//! A device may report no end state in either register after the last
+//! image. The sequence then keeps returning [`Progress::Waiting`] after the
+//! activation, and [`FifoPush::activated_images`] tells the caller how many
+//! images the device took.
 //!
 //! The crate is test support and holds no transport framing and no retry
 //! policy.
@@ -87,17 +99,46 @@ pub trait RegisterAccess {
     fn read(&mut self, command: RecoveryCommand, resp: &mut [u8]) -> Result<usize, Self::Error>;
 }
 
+/// What an [`ImageSource`] answers for an image index.
+pub enum ImageLookup<'a> {
+    /// The image. The sequence checks the size and pushes the image.
+    Ready(&'a dyn ByteSource),
+    /// The source holds the image but cannot serve reads yet, for example
+    /// while a fetch runs. The sequence waits and looks the image up again.
+    NotReady,
+    /// The source holds no image for the index.
+    NotHeld,
+}
+
+/// The images a Recovery Agent can push, by the image index the device
+/// requests in `RECOVERY_STATUS`.
+///
+/// The source decides where an image comes from (flash, a fetch from another
+/// component, a test buffer), so `FifoPush` needs only the lookup.
+pub trait ImageSource {
+    /// Looks up the image for `index`. `FifoPush` calls `image` on every
+    /// step while the device waits for the image, so a source that is still
+    /// fetching returns [`ImageLookup::NotReady`] and does not block.
+    fn image(&self, index: ImageIndex) -> ImageLookup<'_>;
+}
+
 /// The access the next [`FifoPush::step`] makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     /// Read `PROT_CAP` and check the capabilities the push needs.
     ReadProtCap,
-    /// Read `DEVICE_STATUS` until the device reports recovery mode.
+    /// Read `DEVICE_STATUS` until the device reports recovery mode, healthy
+    /// or a failure state.
     ReadDeviceStatus,
     /// Write `RECOVERY_CTRL` with no activation, which clears an activation
     /// an earlier sequence left behind.
     ClearRecoveryCtrl,
-    /// Read `RECOVERY_STATUS` until the device waits for an image.
+    /// Read `RECOVERY_STATUS` until the device waits for an image, then look
+    /// up the image for the index the device requests. Before the first
+    /// activation a failure state makes the step return
+    /// [`Progress::Waiting`], because the device can still hold the failure
+    /// state of an earlier sequence. After an activation a failure state
+    /// ends the sequence with [`Outcome::Failed`].
     ReadRecoveryStatus,
     /// Write `INDIRECT_FIFO_CTRL` with the reset and the image size.
     AnnounceImage,
@@ -109,14 +150,18 @@ pub enum Phase {
     WriteChunk,
     /// Read `DEVICE_STATUS` for the protocol error of the last write.
     ConfirmWrite,
-    /// Read `DEVICE_STATUS` until the device reports recovery pending. The
-    /// sequence enters `AwaitRecoveryPending` after the device took the last
-    /// chunk.
+    /// Read `DEVICE_STATUS` until the device reports recovery pending or a
+    /// failure state. The device has taken the last chunk at this point.
     AwaitRecoveryPending,
     /// Write `RECOVERY_CTRL` with the activation.
     Activate,
-    /// Read `RECOVERY_STATUS` until the device reports an end state.
+    /// Read `RECOVERY_STATUS` for an end state. Without an end state the
+    /// next step reads `DEVICE_STATUS`.
     PollRecoveryStatus,
+    /// Read `DEVICE_STATUS` for an end state or for recovery mode, which
+    /// means the device requests another image. Without either the next
+    /// step reads `RECOVERY_STATUS` again.
+    PollDeviceStatus,
     /// The device refused a write. Every further step returns the same
     /// [`AgentError::Protocol`] and makes no access.
     WriteRefused {
@@ -135,7 +180,9 @@ pub enum Phase {
 pub enum Outcome {
     /// The device reported `Healthy` before the push, so no recovery ran.
     DeviceHealthy,
-    /// The device reported the pushed image as booted.
+    /// The device reported the recovery as successful in `RECOVERY_STATUS`,
+    /// or reported `Healthy` or `RunningRecoveryImage` in `DEVICE_STATUS`
+    /// after an activation.
     Success,
     /// The device reported a failure state for an image.
     Failed {
@@ -143,6 +190,11 @@ pub enum Outcome {
         state: RecoveryState,
         /// The image the failure state refers to.
         image: ImageIndex,
+    },
+    /// The device reported `BootFailure` or `FatalError` in `DEVICE_STATUS`.
+    DeviceFailed {
+        /// The failure state of `DEVICE_STATUS`.
+        state: DeviceState,
     },
 }
 
@@ -153,8 +205,9 @@ pub enum Progress {
     Continue,
     /// The step wrote this many image bytes to the FIFO.
     ChunkWritten(usize),
-    /// The device is not in the state [`FifoPush::phase`] waits for. The
-    /// next step makes the same access again.
+    /// The device is not in the state [`FifoPush::phase`] waits for, or the
+    /// image source is not ready. The caller decides how long to wait
+    /// before the next step.
     Waiting,
     /// The sequence ended.
     Done(Outcome),
@@ -195,6 +248,13 @@ pub enum AgentError<E> {
     },
     /// The image source failed a read.
     ImageRead(ByteReadError),
+    /// The device requests an index the image source does not hold, or a
+    /// second image from a `FifoPush` that [`FifoPush::new`] built with 1
+    /// image.
+    ImageNotHeld(ImageIndex),
+    /// The image for the index the device requests has a size the FIFO
+    /// registers cannot state.
+    ImageSize(ImageSizeError),
     /// The device and the scratch buffer leave no room for 4 bytes of a
     /// chunk.
     NoChunkSpace,
@@ -206,17 +266,56 @@ impl<E> From<ByteReadError> for AgentError<E> {
     }
 }
 
-/// The image size in bytes that [`FifoPush::new`] refused: 0, a size that
-/// does not divide by 4, or a size past the 32-bit count of 4-byte units in
-/// `INDIRECT_FIFO_CTRL`.
+impl<E> From<ImageSizeError> for AgentError<E> {
+    fn from(e: ImageSizeError) -> Self {
+        Self::ImageSize(e)
+    }
+}
+
+/// An image size in bytes that the FIFO registers cannot state: 0, a size
+/// that does not divide by 4, or a size past the 32-bit count of 4-byte
+/// units in `INDIRECT_FIFO_CTRL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageSizeError(pub u64);
 
-/// The push of an image through the FIFO, from the capability read to the
-/// end state of `RECOVERY_STATUS`.
+/// The image size as the count of 4-byte units `INDIRECT_FIFO_CTRL` takes.
+fn image_dwords(image: &dyn ByteSource) -> Result<u32, ImageSizeError> {
+    let len = image.len();
+    if len == 0 || len % DWORD != 0 {
+        return Err(ImageSizeError(len));
+    }
+    u32::try_from(len / DWORD).map_err(|_| ImageSizeError(len))
+}
+
+/// Stands in for the image until the device requests an index.
+struct NoImage;
+
+impl ByteSource for NoImage {
+    fn len(&self) -> u64 {
+        0
+    }
+
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<(), ByteReadError> {
+        Err(ByteReadError::OutOfRange)
+    }
+}
+
+/// Where the sequence takes the image for a requested index from.
+/// [`FifoPush::new`] takes 1 image and has no lookup, so a second request
+/// finds no image to push.
+#[derive(Clone, Copy)]
+enum Images<'a> {
+    One,
+    Source(&'a dyn ImageSource),
+}
+
+/// The push of the images a device requests through the FIFO, from the
+/// capability read to the end state the device reports.
 pub struct FifoPush<'a> {
+    images: Images<'a>,
     image: &'a dyn ByteSource,
     image_dwords: u32,
+    activated: u32,
     cms: u8,
     selection: ImageSelection,
     phase: Phase,
@@ -236,14 +335,12 @@ impl<'a> FifoPush<'a> {
         cms: u8,
         selection: ImageSelection,
     ) -> Result<Self, ImageSizeError> {
-        let len = image.len();
-        if len == 0 || len % DWORD != 0 {
-            return Err(ImageSizeError(len));
-        }
-        let image_dwords = u32::try_from(len / DWORD).map_err(|_| ImageSizeError(len))?;
+        let image_dwords = image_dwords(image)?;
         Ok(Self {
+            images: Images::One,
             image,
             image_dwords,
+            activated: 0,
             cms,
             selection,
             phase: Phase::ReadProtCap,
@@ -254,13 +351,42 @@ impl<'a> FifoPush<'a> {
         })
     }
 
+    /// Prepares the push of every image the device requests from `source`
+    /// into the component memory space `cms`.
+    ///
+    /// `selection` is byte 1 of each `RECOVERY_CTRL` write that activates an
+    /// image. `with_source` returns no `Result`, because the sequence checks
+    /// the size of an image when the device requests the index, and returns
+    /// [`AgentError::ImageSize`] from that step.
+    pub fn with_source(source: &'a dyn ImageSource, cms: u8, selection: ImageSelection) -> Self {
+        Self {
+            images: Images::Source(source),
+            image: &NoImage,
+            image_dwords: 0,
+            activated: 0,
+            cms,
+            selection,
+            phase: Phase::ReadProtCap,
+            pushed: 0,
+            max_transfer: 0,
+            written: RecoveryCommand::RecoveryCtrl,
+            after_write: Phase::ReadRecoveryStatus,
+        }
+    }
+
+    /// How many images the device activated: the activation writes the
+    /// device took without a protocol error.
+    pub fn activated_images(&self) -> u32 {
+        self.activated
+    }
+
     /// The access the next step makes.
     pub fn phase(&self) -> Phase {
         self.phase
     }
 
-    /// How many image bytes the sequence has written to the FIFO, counting a
-    /// chunk the device refused.
+    /// How many bytes of the current image the sequence has written to the
+    /// FIFO, counting a chunk the device refused.
     pub fn pushed_bytes(&self) -> u64 {
         self.pushed
     }
@@ -294,6 +420,9 @@ impl<'a> FifoPush<'a> {
             Phase::ReadDeviceStatus => match device_state(regs, &mut resp)? {
                 DeviceState::Healthy => self.finish(Outcome::DeviceHealthy),
                 DeviceState::RecoveryModeReady => self.advance(Phase::ClearRecoveryCtrl),
+                state @ (DeviceState::BootFailure | DeviceState::FatalError) => {
+                    self.finish(Outcome::DeviceFailed { state })
+                }
                 _ => Ok(Progress::Waiting),
             },
             Phase::ClearRecoveryCtrl => {
@@ -307,7 +436,19 @@ impl<'a> FifoPush<'a> {
                 )
             }
             Phase::ReadRecoveryStatus => match recovery_status(regs, &mut resp)? {
-                (RecoveryState::AwaitingImage, _) => self.advance(Phase::AnnounceImage),
+                (RecoveryState::AwaitingImage, index) => self.select_image(index),
+                // Before the first activation a failure state can be left
+                // over from an earlier sequence, because the device writes
+                // recovery mode to `DEVICE_STATUS` before it writes awaiting
+                // image to `RECOVERY_STATUS`. The sequence waits for the
+                // device to write awaiting image.
+                (
+                    state @ (RecoveryState::Failed
+                    | RecoveryState::AuthenticationError
+                    | RecoveryState::EnterRecoveryError
+                    | RecoveryState::InvalidComponentAddressSpace),
+                    image,
+                ) if self.activated != 0 => self.finish(Outcome::Failed { state, image }),
                 _ => Ok(Progress::Waiting),
             },
             Phase::AnnounceImage => {
@@ -378,10 +519,16 @@ impl<'a> FifoPush<'a> {
                     self.phase = Phase::WriteRefused { command, code };
                     return Err(AgentError::Protocol { command, code });
                 }
+                if self.after_write == Phase::PollRecoveryStatus {
+                    self.activated = self.activated.saturating_add(1);
+                }
                 self.advance(self.after_write)
             }
             Phase::AwaitRecoveryPending => match device_state(regs, &mut resp)? {
                 DeviceState::RecoveryPending => self.advance(Phase::Activate),
+                state @ (DeviceState::BootFailure | DeviceState::FatalError) => {
+                    self.finish(Outcome::DeviceFailed { state })
+                }
                 _ => Ok(Progress::Waiting),
             },
             Phase::Activate => {
@@ -403,11 +550,46 @@ impl<'a> FifoPush<'a> {
                     | RecoveryState::InvalidComponentAddressSpace),
                     image,
                 ) => self.finish(Outcome::Failed { state, image }),
-                _ => Ok(Progress::Waiting),
+                _ => self.advance(Phase::PollDeviceStatus),
+            },
+            Phase::PollDeviceStatus => match device_state(regs, &mut resp)? {
+                DeviceState::Healthy | DeviceState::RunningRecoveryImage => {
+                    self.finish(Outcome::Success)
+                }
+                state @ (DeviceState::BootFailure | DeviceState::FatalError) => {
+                    self.finish(Outcome::DeviceFailed { state })
+                }
+                // The device requests another image.
+                DeviceState::RecoveryModeReady => self.advance(Phase::ReadRecoveryStatus),
+                _ => {
+                    self.phase = Phase::PollRecoveryStatus;
+                    Ok(Progress::Waiting)
+                }
             },
             Phase::WriteRefused { command, code } => Err(AgentError::Protocol { command, code }),
             Phase::Done(outcome) => Ok(Progress::Done(outcome)),
         }
+    }
+
+    /// Takes the image for `index` and moves on to the announcement, with
+    /// the count of pushed bytes back at 0. While the source is not ready
+    /// the phase stays, so the next step reads `RECOVERY_STATUS` again.
+    fn select_image<E>(&mut self, index: ImageIndex) -> Result<Progress, AgentError<E>> {
+        match self.images {
+            // `FifoPush::new` holds 1 image, which the first activation used.
+            Images::One if self.activated != 0 => return Err(AgentError::ImageNotHeld(index)),
+            Images::One => {}
+            Images::Source(source) => match source.image(index) {
+                ImageLookup::Ready(image) => {
+                    self.image_dwords = image_dwords(image)?;
+                    self.image = image;
+                }
+                ImageLookup::NotReady => return Ok(Progress::Waiting),
+                ImageLookup::NotHeld => return Err(AgentError::ImageNotHeld(index)),
+            },
+        }
+        self.pushed = 0;
+        self.advance(Phase::AnnounceImage)
     }
 
     fn advance<E>(&mut self, next: Phase) -> Result<Progress, AgentError<E>> {

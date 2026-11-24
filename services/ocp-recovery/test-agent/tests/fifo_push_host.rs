@@ -6,7 +6,10 @@
 //! [`FifoPush`] plays the Recovery Agent and calls the device through
 //! [`dispatch`] alone. The test plays the policy side of the device between
 //! steps: it reports recovery pending once the image is complete and writes
-//! the end state after the activation, as the recovery flow would.
+//! the end state after the activation, as the recovery flow would. For a
+//! device that boots from several images, the test requests the next image
+//! as Caliptra does: recovery mode in `DEVICE_STATUS`, then the next image
+//! index in `RECOVERY_STATUS`.
 
 use openprot_ocp_recovery_api::regs::{
     capability, DeviceState, ImageIndex, ImageSelection, IndirectFifoStatus, ProtCap,
@@ -15,8 +18,10 @@ use openprot_ocp_recovery_api::regs::{
 use openprot_ocp_recovery_api::{ProtocolError, RecoveryCommand};
 use openprot_ocp_recovery_server::{dispatch, RamStaging, RecoveryInterface};
 use openprot_ocp_recovery_test_agent::{
-    AgentError, FifoPush, ImageSizeError, Outcome, Phase, Progress, RegisterAccess,
+    AgentError, FifoPush, ImageLookup, ImageSizeError, ImageSource, Outcome, Phase, Progress,
+    RegisterAccess,
 };
+use std::cell::Cell;
 use util_io::{ByteReadError, ByteSource};
 
 /// Largest transfer the device reports in `INDIRECT_FIFO_STATUS`.
@@ -610,4 +615,448 @@ fn an_image_size_the_fifo_registers_cannot_state_is_refused_before_any_access() 
         FifoPush::new(&empty, CODE_CMS, ImageSelection::None).err(),
         Some(ImageSizeError(0))
     );
+}
+
+/// How often a test polls a device that reports no end state.
+const POLL_ROUNDS: usize = 3;
+
+/// What the test source answers for an image index.
+enum Held {
+    Image(SliceImage),
+    /// The source holds the image but cannot serve reads yet.
+    Fetching,
+    /// The source answers not ready to the first `lookups_left` lookups and
+    /// serves the image to every later lookup.
+    FetchedLater {
+        image: SliceImage,
+        lookups_left: Cell<u32>,
+    },
+}
+
+/// An image source over a list, where the position is the image index.
+struct ImageList(Vec<Held>);
+
+impl ImageSource for ImageList {
+    fn image(&self, index: ImageIndex) -> ImageLookup<'_> {
+        match self.0.get(usize::from(index.get())) {
+            Some(Held::Image(image)) => ImageLookup::Ready(image),
+            Some(Held::Fetching) => ImageLookup::NotReady,
+            Some(Held::FetchedLater {
+                image,
+                lookups_left,
+            }) => match lookups_left.get().checked_sub(1) {
+                Some(left) => {
+                    lookups_left.set(left);
+                    ImageLookup::NotReady
+                }
+                None => ImageLookup::Ready(image),
+            },
+            None => ImageLookup::NotHeld,
+        }
+    }
+}
+
+/// Sizes of the images a device with several images requests, by index.
+/// Each differs from the others, so a push of the wrong image shows in the
+/// staged length.
+const IMAGE_SIZES: [usize; 3] = [IMAGE_BYTES, 2 * DEVICE_MAX_TRANSFER, 3 * DWORD];
+
+fn image_index(index: usize) -> ImageIndex {
+    ImageIndex::new(index as u8).expect("the test index fits in 4 bits")
+}
+
+/// Runs the push of the current image. Leaves the sequence in
+/// `PollRecoveryStatus` with the activation taken on the device.
+fn push_and_activate(push: &mut FifoPush<'_>, device: &mut Device, scratch: &mut [u8]) {
+    let stopped = run_until_it_stops(push, device, scratch);
+    assert_eq!(stopped, Ok(Progress::Waiting));
+    assert_eq!(push.phase(), Phase::AwaitRecoveryPending);
+    device.iface.set_device_state(
+        DeviceState::RecoveryPending,
+        RecoveryReason::FlashlessStreamingBoot,
+    );
+    let stopped = run_until_it_stops(push, device, scratch);
+    assert_eq!(stopped, Ok(Progress::Waiting));
+    assert_eq!(push.phase(), Phase::PollRecoveryStatus);
+    device
+        .iface
+        .take_activation()
+        .expect("the agent requested the activation");
+}
+
+/// The device requests `index` as Caliptra does after an activation.
+fn request_image(device: &mut Device, index: ImageIndex) {
+    device.iface.set_device_state(
+        DeviceState::RecoveryModeReady,
+        RecoveryReason::FlashlessStreamingBoot,
+    );
+    device
+        .iface
+        .set_recovery_status(RecoveryState::AwaitingImage, index);
+}
+
+fn staged_bytes(device: &Device, len: usize) -> Vec<u8> {
+    let mut staged = vec![0u8; len];
+    device
+        .staging
+        .read_at(0, &mut staged)
+        .expect("the staging region holds the whole image");
+    staged
+}
+
+#[test]
+fn the_agent_pushes_the_image_of_every_index_the_device_requests() {
+    let images = ImageList(
+        IMAGE_SIZES
+            .iter()
+            .map(|&len| Held::Image(SliceImage::pattern(len)))
+            .collect(),
+    );
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push = FifoPush::with_source(&images, CODE_CMS, ImageSelection::None);
+
+    for (index, &len) in IMAGE_SIZES.iter().enumerate() {
+        if index != 0 {
+            request_image(&mut device, image_index(index));
+        }
+        push_and_activate(&mut push, &mut device, &mut scratch);
+        assert_eq!(push.pushed_bytes(), len as u64);
+        assert_eq!(push.activated_images(), index as u32 + 1);
+        let Held::Image(image) = &images.0[index] else {
+            panic!("the test list holds an image at every index");
+        };
+        assert_eq!(staged_bytes(&device, len), image.0);
+        device
+            .iface
+            .set_recovery_status(RecoveryState::BootingImage, image_index(index));
+    }
+
+    device.iface.set_recovery_status(
+        RecoveryState::Successful,
+        image_index(IMAGE_SIZES.len() - 1),
+    );
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+    assert_eq!(stopped, Ok(Progress::Done(Outcome::Success)));
+}
+
+#[test]
+fn a_device_that_requests_the_same_index_again_gets_the_same_image_again() {
+    let images = ImageList(vec![Held::Image(SliceImage::pattern(IMAGE_BYTES))]);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push = FifoPush::with_source(&images, CODE_CMS, ImageSelection::None);
+    push_and_activate(&mut push, &mut device, &mut scratch);
+
+    request_image(&mut device, ImageIndex::FIRST);
+    push_and_activate(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(push.activated_images(), 2);
+    assert_eq!(device.writes_to(RecoveryCommand::IndirectFifoCtrl).len(), 2);
+    let Held::Image(image) = &images.0[0] else {
+        panic!("the test list holds an image at index 0");
+    };
+    assert_eq!(staged_bytes(&device, IMAGE_BYTES), image.0);
+}
+
+/// Right after the activation the device still reports the request it made
+/// before the push. `DEVICE_STATUS` reads recovery pending, not recovery
+/// mode, so the agent starts no second push.
+#[test]
+fn awaiting_image_without_recovery_mode_after_the_activation_starts_no_second_push() {
+    let images = ImageList(vec![Held::Image(SliceImage::pattern(IMAGE_BYTES))]);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push = FifoPush::with_source(&images, CODE_CMS, ImageSelection::None);
+    push_and_activate(&mut push, &mut device, &mut scratch);
+
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(stopped, Ok(Progress::Waiting));
+    assert_eq!(push.phase(), Phase::PollRecoveryStatus);
+    assert_eq!(device.writes_to(RecoveryCommand::IndirectFifoCtrl).len(), 1);
+}
+
+#[test]
+fn an_index_the_source_does_not_hold_returns_image_not_held_and_no_announcement_follows() {
+    let images = ImageList(vec![Held::Image(SliceImage::pattern(IMAGE_BYTES))]);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push = FifoPush::with_source(&images, CODE_CMS, ImageSelection::None);
+    push_and_activate(&mut push, &mut device, &mut scratch);
+
+    let missing = image_index(1);
+    request_image(&mut device, missing);
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(stopped, Err(AgentError::ImageNotHeld(missing)));
+    assert_eq!(device.writes_to(RecoveryCommand::IndirectFifoCtrl).len(), 1);
+}
+
+#[test]
+fn a_source_that_is_not_ready_makes_the_sequence_wait_before_the_announcement() {
+    let images = ImageList(vec![Held::Fetching]);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push = FifoPush::with_source(&images, CODE_CMS, ImageSelection::None);
+
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(stopped, Ok(Progress::Waiting));
+    assert_eq!(push.phase(), Phase::ReadRecoveryStatus);
+    assert!(device
+        .writes_to(RecoveryCommand::IndirectFifoCtrl)
+        .is_empty());
+}
+
+#[test]
+fn an_image_of_a_size_the_fifo_registers_cannot_state_returns_image_size_at_the_request() {
+    let odd_len = IMAGE_BYTES + 1;
+    let images = ImageList(vec![
+        Held::Image(SliceImage::pattern(IMAGE_BYTES)),
+        Held::Image(SliceImage::pattern(odd_len)),
+    ]);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push = FifoPush::with_source(&images, CODE_CMS, ImageSelection::None);
+    push_and_activate(&mut push, &mut device, &mut scratch);
+
+    request_image(&mut device, image_index(1));
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(
+        stopped,
+        Err(AgentError::ImageSize(ImageSizeError(odd_len as u64)))
+    );
+    assert_eq!(device.writes_to(RecoveryCommand::IndirectFifoCtrl).len(), 1);
+}
+
+#[test]
+fn fifo_push_new_returns_image_not_held_when_the_device_requests_a_second_image() {
+    let image = SliceImage::pattern(IMAGE_BYTES);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push =
+        FifoPush::new(&image, CODE_CMS, ImageSelection::None).expect("the image size divides by 4");
+    push_and_activate(&mut push, &mut device, &mut scratch);
+
+    request_image(&mut device, image_index(1));
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(stopped, Err(AgentError::ImageNotHeld(image_index(1))));
+}
+
+#[test]
+fn healthy_in_device_status_after_an_activation_ends_the_sequence_with_success() {
+    let image = SliceImage::pattern(IMAGE_BYTES);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push =
+        FifoPush::new(&image, CODE_CMS, ImageSelection::None).expect("the image size divides by 4");
+    push_and_activate(&mut push, &mut device, &mut scratch);
+
+    // `RECOVERY_STATUS` holds no end state, so only `DEVICE_STATUS` can end
+    // the sequence.
+    device
+        .iface
+        .set_recovery_status(RecoveryState::BootingImage, ImageIndex::FIRST);
+    device
+        .iface
+        .set_device_state(DeviceState::Healthy, RecoveryReason::NoFailure);
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(stopped, Ok(Progress::Done(Outcome::Success)));
+}
+
+#[test]
+fn boot_failure_in_device_status_after_an_activation_ends_the_sequence_with_the_state() {
+    let image = SliceImage::pattern(IMAGE_BYTES);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push =
+        FifoPush::new(&image, CODE_CMS, ImageSelection::None).expect("the image size divides by 4");
+    push_and_activate(&mut push, &mut device, &mut scratch);
+
+    device
+        .iface
+        .set_recovery_status(RecoveryState::BootingImage, ImageIndex::FIRST);
+    device.iface.set_device_state(
+        DeviceState::BootFailure,
+        RecoveryReason::RecoveryFirmwareAuthFailure,
+    );
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(
+        stopped,
+        Ok(Progress::Done(Outcome::DeviceFailed {
+            state: DeviceState::BootFailure
+        }))
+    );
+}
+
+#[test]
+fn boot_failure_in_device_status_before_the_push_ends_the_sequence_before_any_write() {
+    let image = SliceImage::pattern(IMAGE_BYTES);
+    let mut device = Device::with_capabilities(STREAMING_CAPABILITIES);
+    device.iface.set_device_state(
+        DeviceState::BootFailure,
+        RecoveryReason::RecoveryFirmwareAuthFailure,
+    );
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push =
+        FifoPush::new(&image, CODE_CMS, ImageSelection::None).expect("the image size divides by 4");
+
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(
+        stopped,
+        Ok(Progress::Done(Outcome::DeviceFailed {
+            state: DeviceState::BootFailure
+        }))
+    );
+    assert!(device.writes.is_empty());
+}
+
+/// The device reports no end state in either register after the last image.
+/// The sequence waits, and the count of activated images tells the caller
+/// that the device took the image.
+#[test]
+fn a_device_that_reports_no_end_state_leaves_the_sequence_waiting_with_the_activation_count() {
+    let image = SliceImage::pattern(IMAGE_BYTES);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push =
+        FifoPush::new(&image, CODE_CMS, ImageSelection::None).expect("the image size divides by 4");
+    push_and_activate(&mut push, &mut device, &mut scratch);
+    device
+        .iface
+        .set_recovery_status(RecoveryState::BootingImage, ImageIndex::FIRST);
+
+    for _ in 0..POLL_ROUNDS {
+        let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+        assert_eq!(stopped, Ok(Progress::Waiting));
+        assert_eq!(push.phase(), Phase::PollRecoveryStatus);
+    }
+    assert_eq!(push.activated_images(), 1);
+}
+
+#[test]
+fn running_recovery_image_in_device_status_after_an_activation_ends_the_sequence_with_success() {
+    let image = SliceImage::pattern(IMAGE_BYTES);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push =
+        FifoPush::new(&image, CODE_CMS, ImageSelection::None).expect("the image size divides by 4");
+    push_and_activate(&mut push, &mut device, &mut scratch);
+
+    device
+        .iface
+        .set_recovery_status(RecoveryState::BootingImage, ImageIndex::FIRST);
+    device
+        .iface
+        .set_device_state(DeviceState::RunningRecoveryImage, RecoveryReason::NoFailure);
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(stopped, Ok(Progress::Done(Outcome::Success)));
+}
+
+#[test]
+fn fatal_error_in_device_status_before_recovery_pending_ends_the_sequence_and_no_activation_follows(
+) {
+    let image = SliceImage::pattern(IMAGE_BYTES);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push =
+        FifoPush::new(&image, CODE_CMS, ImageSelection::None).expect("the image size divides by 4");
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+    assert_eq!(stopped, Ok(Progress::Waiting));
+    assert_eq!(push.phase(), Phase::AwaitRecoveryPending);
+
+    device
+        .iface
+        .set_device_state(DeviceState::FatalError, RecoveryReason::NoFailure);
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(
+        stopped,
+        Ok(Progress::Done(Outcome::DeviceFailed {
+            state: DeviceState::FatalError
+        }))
+    );
+    assert_eq!(push.activated_images(), 0);
+    assert!(device.iface.take_activation().is_none());
+}
+
+#[test]
+fn a_failure_state_in_recovery_status_at_the_next_request_ends_the_sequence() {
+    let images = ImageList(vec![Held::Image(SliceImage::pattern(IMAGE_BYTES))]);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push = FifoPush::with_source(&images, CODE_CMS, ImageSelection::None);
+    push_and_activate(&mut push, &mut device, &mut scratch);
+
+    // The device boots the image, reports recovery mode again, and then
+    // the failure of the image.
+    device
+        .iface
+        .set_recovery_status(RecoveryState::BootingImage, ImageIndex::FIRST);
+    device.iface.set_device_state(
+        DeviceState::RecoveryModeReady,
+        RecoveryReason::FlashlessStreamingBoot,
+    );
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+    assert_eq!(stopped, Ok(Progress::Waiting));
+    assert_eq!(push.phase(), Phase::ReadRecoveryStatus);
+    device
+        .iface
+        .set_recovery_status(RecoveryState::Failed, ImageIndex::FIRST);
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(
+        stopped,
+        Ok(Progress::Done(Outcome::Failed {
+            state: RecoveryState::Failed,
+            image: ImageIndex::FIRST,
+        }))
+    );
+}
+
+#[test]
+fn a_source_that_turns_ready_gets_a_second_lookup_and_the_push_follows() {
+    let images = ImageList(vec![Held::FetchedLater {
+        image: SliceImage::pattern(IMAGE_BYTES),
+        lookups_left: Cell::new(1),
+    }]);
+    let mut device = Device::awaiting_an_image();
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push = FifoPush::with_source(&images, CODE_CMS, ImageSelection::None);
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+    assert_eq!(stopped, Ok(Progress::Waiting));
+    assert_eq!(push.phase(), Phase::ReadRecoveryStatus);
+
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(stopped, Ok(Progress::Waiting));
+    assert_eq!(push.phase(), Phase::AwaitRecoveryPending);
+    assert_eq!(push.pushed_bytes(), IMAGE_BYTES as u64);
+}
+
+/// A device that failed an earlier recovery writes recovery mode to
+/// `DEVICE_STATUS` first and awaiting image to `RECOVERY_STATUS` second, so
+/// the sequence can read the old failure state and waits.
+#[test]
+fn a_failure_state_in_recovery_status_before_the_first_activation_makes_the_sequence_wait() {
+    let image = SliceImage::pattern(IMAGE_BYTES);
+    let mut device = Device::awaiting_an_image();
+    device
+        .iface
+        .set_recovery_status(RecoveryState::Failed, ImageIndex::FIRST);
+    let mut scratch = [0u8; DEVICE_MAX_TRANSFER];
+    let mut push =
+        FifoPush::new(&image, CODE_CMS, ImageSelection::None).expect("the image size divides by 4");
+
+    let stopped = run_until_it_stops(&mut push, &mut device, &mut scratch);
+
+    assert_eq!(stopped, Ok(Progress::Waiting));
+    assert_eq!(push.phase(), Phase::ReadRecoveryStatus);
 }
