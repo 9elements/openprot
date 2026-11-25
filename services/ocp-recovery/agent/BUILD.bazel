@@ -17,6 +17,22 @@ rust_library(
     ],
 )
 
+# Test support: the device behind ocp_recovery_server::dispatch and the test
+# images, for the host tests of the Recovery Agent.
+rust_library(
+    name = "ocp_recovery_test_fixture",
+    testonly = True,
+    srcs = ["tests/fixture.rs"],
+    crate_name = "ocp_recovery_test_fixture",
+    edition = "2024",
+    deps = [
+        ":ocp_recovery_agent",
+        "//services/ocp-recovery/api:ocp_recovery_api",
+        "//services/ocp-recovery/server:ocp_recovery_server",
+        "//util/io",
+    ],
+)
+
 # Host end-to-end: the push sequence against ocp_recovery_server::dispatch.
 # No kernel, no QEMU, no transport.
 rust_test(
@@ -25,8 +41,8 @@ rust_test(
     edition = "2024",
     deps = [
         ":ocp_recovery_agent",
+        ":ocp_recovery_test_fixture",
         "//services/ocp-recovery/api:ocp_recovery_api",
-        "//services/ocp-recovery/server:ocp_recovery_server",
         "//util/io",
     ],
 )
