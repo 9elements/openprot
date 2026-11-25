@@ -483,8 +483,10 @@ impl DeviceReset {
 pub enum ImageSelection {
     /// No operation.
     None = 0x0,
-    /// Use the image the agent pushed into the memory window.
-    FromMemoryWindow = 0x1,
+    /// Use the image in the component memory space that byte 0 selects. The
+    /// agent pushed the image into the selected component memory space,
+    /// through the memory window or the FIFO.
+    FromCms = 0x1,
     /// Use the image the device holds.
     FromDevice = 0x2,
 }
@@ -495,7 +497,7 @@ impl ImageSelection {
     pub fn from_byte(value: u8) -> Option<Self> {
         match value {
             0x0 => Some(Self::None),
-            0x1 => Some(Self::FromMemoryWindow),
+            0x1 => Some(Self::FromCms),
             0x2 => Some(Self::FromDevice),
             _ => None,
         }
@@ -866,6 +868,10 @@ impl IndirectFifoStatus {
     /// Byte 0 bit 1: the FIFO is full.
     pub const FULL: u8 = 1 << 1;
 
+    /// How many entries of 4 bytes the device keeps free out of the FIFO
+    /// size, so that a full FIFO and an empty FIFO show different indices.
+    pub const RESERVED_ENTRIES: u32 = 1;
+
     /// Byte 1 value for a code region the agent writes the image into.
     pub const REGION_CODE: u8 = 0b000;
     /// Byte 1 value for a log region the agent reads.
@@ -915,6 +921,13 @@ impl IndirectFifoStatus {
     /// Largest payload one `INDIRECT_FIFO_DATA` access may carry, in bytes.
     pub fn max_transfer_bytes(&self) -> u64 {
         u64::from(u32::from_le(self.max_transfer_dwords)) * 4
+    }
+
+    /// How many bytes the FIFO holds at most: the FIFO size minus
+    /// [`Self::RESERVED_ENTRIES`].
+    pub fn usable_bytes(&self) -> u64 {
+        let entries = u32::from_le(self.fifo_size_dwords).saturating_sub(Self::RESERVED_ENTRIES);
+        u64::from(entries) * 4
     }
 
     /// Resets both indices and reports the FIFO empty, which is what the
@@ -987,11 +1000,11 @@ mod tests {
 
     #[test]
     fn from_wire_resolves_the_length_once_for_the_register_that_takes_it() {
-        let wire = [0u8, ImageSelection::FromMemoryWindow as u8, ACTIVATE_IDLE];
+        let wire = [0u8, ImageSelection::FromCms as u8, ACTIVATE_IDLE];
         let sized = RecoveryCtrl::from_wire(&wire, crate::SMBUS_MAX_PAYLOAD).unwrap();
         assert_eq!(sized, &wire);
 
-        let short = [0u8, ImageSelection::FromMemoryWindow as u8];
+        let short = [0u8, ImageSelection::FromCms as u8];
         let err = RecoveryCtrl::from_wire(&short, crate::SMBUS_MAX_PAYLOAD).unwrap_err();
         assert_eq!(
             crate::ProtocolError::from(err),
@@ -1002,13 +1015,13 @@ mod tests {
     #[test]
     fn writing_one_to_the_activate_field_is_refused_and_changes_nothing() {
         let mut ctrl = RecoveryCtrl::default();
-        ctrl.apply_agent_write(&[0, ImageSelection::FromMemoryWindow as u8, ACTIVATE_IDLE])
+        ctrl.apply_agent_write(&[0, ImageSelection::FromCms as u8, ACTIVATE_IDLE])
             .unwrap();
 
         // A device that cleared byte 2 bitwise would accept 0x1 here and hold
         // 0xe afterwards, which the spec does not define for the field.
         let err = ctrl
-            .apply_agent_write(&[0, ImageSelection::FromMemoryWindow as u8, 0x1])
+            .apply_agent_write(&[0, ImageSelection::FromCms as u8, 0x1])
             .unwrap_err();
         assert_eq!(
             err,
@@ -1029,18 +1042,11 @@ mod tests {
     #[test]
     fn the_agent_activates_and_the_device_clears_the_field() {
         let mut ctrl = RecoveryCtrl::default();
-        ctrl.apply_agent_write(&[
-            2,
-            ImageSelection::FromMemoryWindow as u8,
-            ACTIVATE_RECOVERY_IMAGE,
-        ])
-        .unwrap();
+        ctrl.apply_agent_write(&[2, ImageSelection::FromCms as u8, ACTIVATE_RECOVERY_IMAGE])
+            .unwrap();
         assert!(ctrl.activation_requested());
         assert_eq!(ctrl.cms(), 2);
-        assert_eq!(
-            ctrl.image_selection(),
-            Some(ImageSelection::FromMemoryWindow)
-        );
+        assert_eq!(ctrl.image_selection(), Some(ImageSelection::FromCms));
 
         ctrl.clear_activation();
         assert!(!ctrl.activation_requested());
@@ -1234,6 +1240,18 @@ mod tests {
         assert_eq!(hw.status_bits(), HwStatus::SOFT_ERROR);
 
         assert_eq!(VendorStatusLen::new(VendorStatusLen::MAX + 1), None);
+    }
+
+    #[test]
+    fn the_fifo_holds_its_size_minus_the_reserved_entry() {
+        let size_bytes: u32 = 0x100;
+        let region = IndirectFifoStatus::code_region(size_bytes, 0x40).unwrap();
+        assert_eq!(region.usable_bytes(), u64::from(size_bytes) - 4);
+
+        // A FIFO of size 0 gives 0 usable bytes, because `saturating_sub`
+        // stops at 0.
+        let none = IndirectFifoStatus::code_region(0, 0).unwrap();
+        assert_eq!(none.usable_bytes(), 0);
     }
 
     #[test]

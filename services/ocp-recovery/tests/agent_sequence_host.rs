@@ -389,14 +389,14 @@ fn the_agent_streams_an_image_and_polls_the_device_to_a_terminal_status() {
     // The agent activates the image it pushed.
     device.agent_write(
         RecoveryCommand::RecoveryCtrl,
-        &activate_write(ImageSelection::FromMemoryWindow),
+        &activate_write(ImageSelection::FromCms),
     );
     let request = device
         .iface
         .take_activation()
         .expect("the agent asked for an activation");
     assert_eq!(request.cms, CODE_CMS);
-    assert_eq!(request.selection, Some(ImageSelection::FromMemoryWindow));
+    assert_eq!(request.selection, Some(ImageSelection::FromCms));
     assert!(
         device.iface.take_activation().is_none(),
         "the device acts on one activation once"
@@ -406,10 +406,7 @@ fn the_agent_streams_an_image_and_polls_the_device_to_a_terminal_status() {
     let ctrl = device.agent_read(RecoveryCommand::RecoveryCtrl);
     assert_eq!(ctrl[CTRL_ACTIVATE], ACTIVATE_IDLE);
     assert_eq!(ctrl[CTRL_CMS], CODE_CMS);
-    assert_eq!(
-        ctrl[CTRL_IMAGE_SELECTION],
-        ImageSelection::FromMemoryWindow as u8
-    );
+    assert_eq!(ctrl[CTRL_IMAGE_SELECTION], ImageSelection::FromCms as u8);
 
     // The verify and trial-boot path runs, and the agent follows it.
     device
@@ -477,13 +474,13 @@ fn an_agent_clears_a_stale_activation_before_it_announces_the_next_image() {
     );
     device.agent_write(
         RecoveryCommand::RecoveryCtrl,
-        &activate_write(ImageSelection::FromMemoryWindow),
+        &activate_write(ImageSelection::FromCms),
     );
 
     // An agent that finds a stale activation writes the idle value first.
     // The idle write drops the stale activation, so `take_activation`
     // returns only the activation the agent writes for the next image.
-    let mut idle = activate_write(ImageSelection::FromMemoryWindow);
+    let mut idle = activate_write(ImageSelection::FromCms);
     idle[CTRL_ACTIVATE] = ACTIVATE_IDLE;
     device.agent_write(RecoveryCommand::RecoveryCtrl, &idle);
 
@@ -499,7 +496,7 @@ fn an_agent_clears_a_stale_activation_before_it_announces_the_next_image() {
     );
     device.agent_write(
         RecoveryCommand::RecoveryCtrl,
-        &activate_write(ImageSelection::FromMemoryWindow),
+        &activate_write(ImageSelection::FromCms),
     );
     assert!(device.iface.take_activation().is_some());
     assert!(device.iface.take_activation().is_none());
@@ -512,7 +509,7 @@ fn an_activate_value_of_one_is_refused_and_the_field_keeps_the_idle_value() {
     // 0x1 is what a device that treated byte 2 as a bitwise clear would
     // accept, and it would leave 0xe behind. The write is refused instead,
     // and every byte of the register keeps the value it had.
-    let mut write = activate_write(ImageSelection::FromMemoryWindow);
+    let mut write = activate_write(ImageSelection::FromCms);
     write[CTRL_ACTIVATE] = 0x1;
     device.agent_write(RecoveryCommand::RecoveryCtrl, &write);
 
@@ -540,7 +537,7 @@ fn an_activation_before_the_image_is_complete_still_reaches_the_device() {
 
     device.agent_write(
         RecoveryCommand::RecoveryCtrl,
-        &activate_write(ImageSelection::FromMemoryWindow),
+        &activate_write(ImageSelection::FromCms),
     );
 
     // The dispatch serves registers and does not decide policy: it hands the
