@@ -35,6 +35,10 @@
 //! - `FifoPush` reads `DEVICE_STATUS` after every write, because a write
 //!   carries no answer and the protocol error is the only report of a
 //!   refused write.
+//! - The FPGA model of Caliptra pads an image to a multiple of 256 bytes,
+//!   and a comment in the model says that the last chunk will not finish
+//!   without the padding. `FifoPush` sends the last chunk as long as the
+//!   rest of the image, without padding.
 //!
 //! A device that boots from several images reports recovery mode again
 //! after an activation and names the next image index in `RECOVERY_STATUS`.
@@ -68,6 +72,12 @@ use openprot_ocp_recovery_api::regs::{
 use openprot_ocp_recovery_api::{ProtocolError, RecoveryCommand};
 use util_io::{ByteReadError, ByteSource};
 use zerocopy::FromBytes;
+
+mod recovery_agent;
+
+pub use recovery_agent::{
+    BootCyclePost, PushLimits, PushReport, PushStatus, RecoveryAgent, Served, MIN_CHUNK_BYTES,
+};
 
 /// The FIFO registers count 4-byte units.
 const DWORD: u64 = 4;
@@ -254,6 +264,9 @@ pub enum AgentError<E> {
     /// The image for the index the device requests has a size the FIFO
     /// registers cannot state.
     ImageSize(ImageSizeError),
+    /// The device requests an image after as many activations as
+    /// [`FifoPush::with_image_limit`] allows.
+    ImageLimit(ImageIndex),
     /// The device and the scratch buffer leave no room for 4 bytes of a
     /// chunk.
     NoChunkSpace,
@@ -315,6 +328,7 @@ pub struct FifoPush<'a> {
     image: &'a dyn ByteSource,
     image_dwords: u32,
     activated: u32,
+    max_images: u32,
     cms: u8,
     selection: ImageSelection,
     phase: Phase,
@@ -340,6 +354,7 @@ impl<'a> FifoPush<'a> {
             image,
             image_dwords,
             activated: 0,
+            max_images: u32::MAX,
             cms,
             selection,
             phase: Phase::ReadProtCap,
@@ -363,6 +378,7 @@ impl<'a> FifoPush<'a> {
             image: &NoImage,
             image_dwords: 0,
             activated: 0,
+            max_images: u32::MAX,
             cms,
             selection,
             phase: Phase::ReadProtCap,
@@ -371,6 +387,14 @@ impl<'a> FifoPush<'a> {
             written: RecoveryCommand::RecoveryCtrl,
             after_write: Phase::ReadRecoveryStatus,
         }
+    }
+
+    /// Limits the sequence to `max_images` activations. A request of the
+    /// device for a further image makes the step return
+    /// [`AgentError::ImageLimit`], and the sequence pushes nothing.
+    pub fn with_image_limit(mut self, max_images: u32) -> Self {
+        self.max_images = max_images;
+        self
     }
 
     /// How many images the device activated: the activation writes the
@@ -574,6 +598,9 @@ impl<'a> FifoPush<'a> {
     /// the count of pushed bytes back at 0. While the source is not ready
     /// the phase stays, so the next step reads `RECOVERY_STATUS` again.
     fn select_image<E>(&mut self, index: ImageIndex) -> Result<Progress, AgentError<E>> {
+        if self.activated >= self.max_images {
+            return Err(AgentError::ImageLimit(index));
+        }
         match self.images {
             // `FifoPush::new` holds 1 image, which the first activation used.
             Images::One if self.activated != 0 => return Err(AgentError::ImageNotHeld(index)),

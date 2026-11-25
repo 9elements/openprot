@@ -108,6 +108,19 @@ pub enum ReadFault {
     OtherImageSize,
 }
 
+/// A write the test makes fail once.
+#[derive(Clone, Copy)]
+pub struct WriteFault {
+    /// The command of the write that fails.
+    pub command: RecoveryCommand,
+    /// How many writes of `command` pass before the write that fails.
+    pub passing: usize,
+    /// When true, the device takes the bytes of the failed write, as on a
+    /// bus that lost the acknowledgement alone. When false, the device does
+    /// not see the write.
+    pub arrives: bool,
+}
+
 /// The device behind `dispatch`, which `Device` calls as a transport server
 /// would, plus a record of every access the agent made.
 pub struct Device {
@@ -119,6 +132,8 @@ pub struct Device {
     pub reads: usize,
     /// The fault the next reads of a command carry.
     pub read_fault: Option<(RecoveryCommand, ReadFault)>,
+    /// The write that fails once.
+    pub write_fault: Option<WriteFault>,
 }
 
 impl Device {
@@ -134,6 +149,7 @@ impl Device {
             writes: Vec::new(),
             reads: 0,
             read_fault: None,
+            write_fault: None,
         }
     }
 
@@ -164,15 +180,33 @@ impl RegisterAccess for Device {
 
     fn write(&mut self, command: RecoveryCommand, bytes: &[u8]) -> Result<(), BusFault> {
         self.writes.push((command, bytes.to_vec()));
-        dispatch(
-            &mut self.iface,
-            &mut self.staging,
-            command as u8,
-            Some(bytes),
-            &mut [],
-            self.transport_max,
-        );
-        Ok(())
+        let failed = match self.write_fault {
+            Some(fault) if fault.command == command => match fault.passing.checked_sub(1) {
+                Some(passing) => {
+                    self.write_fault = Some(WriteFault { passing, ..fault });
+                    None
+                }
+                None => {
+                    self.write_fault = None;
+                    Some(fault)
+                }
+            },
+            _ => None,
+        };
+        if failed.is_none_or(|fault| fault.arrives) {
+            dispatch(
+                &mut self.iface,
+                &mut self.staging,
+                command as u8,
+                Some(bytes),
+                &mut [],
+                self.transport_max,
+            );
+        }
+        match failed {
+            Some(_) => Err(BusFault),
+            None => Ok(()),
+        }
     }
 
     fn read(&mut self, command: RecoveryCommand, resp: &mut [u8]) -> Result<usize, BusFault> {

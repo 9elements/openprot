@@ -6,7 +6,10 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 # The Recovery Agent side of the FIFO push, without a transport.
 rust_library(
     name = "ocp_recovery_agent",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/lib.rs",
+        "src/recovery_agent.rs",
+    ],
     crate_name = "openprot_ocp_recovery_agent",
     edition = "2024",
     visibility = ["//visibility:public"],
@@ -44,5 +47,24 @@ rust_test(
         ":ocp_recovery_test_fixture",
         "//services/ocp-recovery/api:ocp_recovery_api",
         "//util/io",
+    ],
+)
+
+# Host tests of the library: build on the host platform, no kernel/QEMU.
+rust_test(
+    name = "ocp_recovery_agent_test",
+    crate = ":ocp_recovery_agent",
+)
+
+# Host end-to-end: the Recovery Agent with posts and reports against
+# ocp_recovery_server::dispatch.
+rust_test(
+    name = "recovery_agent_host_test",
+    srcs = ["tests/recovery_agent_host.rs"],
+    edition = "2024",
+    deps = [
+        ":ocp_recovery_agent",
+        ":ocp_recovery_test_fixture",
+        "//services/ocp-recovery/api:ocp_recovery_api",
     ],
 )
