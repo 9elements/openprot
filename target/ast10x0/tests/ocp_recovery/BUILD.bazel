@@ -70,9 +70,9 @@ rust_app(
     target_compatible_with = TARGET_COMPATIBLE_WITH,
     deps = [
         ":proto",
+        "//services/ocp-recovery/agent:ocp_recovery_agent",
         "//services/ocp-recovery/api:ocp_recovery_api",
         "//services/ocp-recovery/server:ocp_recovery_server",
-        "//services/ocp-recovery/test-agent:ocp_recovery_test_agent",
         "//util/io",
         "//util/ipc",
         "@pigweed//pw_kernel/userspace",

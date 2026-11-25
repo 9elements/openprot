@@ -3,13 +3,11 @@
 
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
-# Test support: the Recovery Agent side of the FIFO push, for the host
-# tests and the QEMU test of the device side.
+# The Recovery Agent side of the FIFO push, without a transport.
 rust_library(
-    name = "ocp_recovery_test_agent",
-    testonly = True,
+    name = "ocp_recovery_agent",
     srcs = ["src/lib.rs"],
-    crate_name = "openprot_ocp_recovery_test_agent",
+    crate_name = "openprot_ocp_recovery_agent",
     edition = "2024",
     visibility = ["//visibility:public"],
     deps = [
@@ -26,7 +24,7 @@ rust_test(
     srcs = ["tests/fifo_push_host.rs"],
     edition = "2024",
     deps = [
-        ":ocp_recovery_test_agent",
+        ":ocp_recovery_agent",
         "//services/ocp-recovery/api:ocp_recovery_api",
         "//services/ocp-recovery/server:ocp_recovery_server",
         "//util/io",

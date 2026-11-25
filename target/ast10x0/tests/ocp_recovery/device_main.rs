@@ -5,7 +5,7 @@
 //! stand-in in place of the transport.
 //!
 //! The app holds the register file and a slot for 1 push. The stand-in is
-//! `FifoPush` from the test-agent crate, which reads and writes the
+//! `FifoPush` from the Recovery Agent crate, which reads and writes the
 //! registers through `dispatch`, as a transport server would with the bytes
 //! a Recovery Agent sends. The stand-in stops where it waits for recovery
 //! pending, because no app in the test image sets that device status. The
@@ -25,13 +25,13 @@ use ocp_recovery_test_proto::{
     pattern, IMAGE_LEN, MAX_TRANSFER, OP_TAKE, REGION_LEN, REPLY_BYTES, REPLY_HEADER_LEN,
     REPLY_IMAGE_COMPLETE,
 };
+use openprot_ocp_recovery_agent::{FifoPush, Phase, Progress, RegisterAccess};
 use openprot_ocp_recovery_api::regs::{
     capability, DeviceState, ImageIndex, ImageSelection, IndirectFifoStatus, ProtCap,
     RecoveryReason, RecoveryState,
 };
 use openprot_ocp_recovery_api::{RecoveryCommand, SMBUS_MAX_PAYLOAD};
 use openprot_ocp_recovery_server::{dispatch, FifoSink, RecoveryInterface, StagingError};
-use openprot_ocp_recovery_test_agent::{FifoPush, Phase, Progress, RegisterAccess};
 use pw_status::{Error, Result};
 use userspace::entry;
 use userspace::syscall::{self, Signals};

@@ -1,8 +1,8 @@
 // Licensed under the Apache-2.0 license
 // SPDX-License-Identifier: Apache-2.0
 
-//! A Recovery Agent for tests: the FIFO push of the images a device requests,
-//! as a step function.
+//! A Recovery Agent: the FIFO push of the images a device requests, as a
+//! step function.
 //!
 //! [`FifoPush::step`] makes at most 1 register access per call and never
 //! sleeps, so the same sequence runs in a host test and inside a kernel app.
@@ -46,8 +46,7 @@
 //! activation, and [`FifoPush::activated_images`] tells the caller how many
 //! images the device took.
 //!
-//! The crate is test support and holds no transport framing and no retry
-//! policy.
+//! The crate holds no transport framing and no retry policy.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]

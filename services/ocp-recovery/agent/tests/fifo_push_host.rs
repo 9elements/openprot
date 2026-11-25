@@ -1,7 +1,7 @@
 // Licensed under the Apache-2.0 license
 // SPDX-License-Identifier: Apache-2.0
 
-//! The FIFO push of the test Recovery Agent against the device dispatch.
+//! The FIFO push of the Recovery Agent against the device dispatch.
 //!
 //! [`FifoPush`] plays the Recovery Agent and calls the device through
 //! [`dispatch`] alone. The test plays the policy side of the device between
@@ -11,16 +11,16 @@
 //! as Caliptra does: recovery mode in `DEVICE_STATUS`, then the next image
 //! index in `RECOVERY_STATUS`.
 
+use openprot_ocp_recovery_agent::{
+    AgentError, FifoPush, ImageLookup, ImageSizeError, ImageSource, Outcome, Phase, Progress,
+    RegisterAccess,
+};
 use openprot_ocp_recovery_api::regs::{
     capability, DeviceState, ImageIndex, ImageSelection, IndirectFifoStatus, ProtCap,
     RecoveryReason, RecoveryState,
 };
 use openprot_ocp_recovery_api::{ProtocolError, RecoveryCommand};
 use openprot_ocp_recovery_server::{dispatch, RamStaging, RecoveryInterface};
-use openprot_ocp_recovery_test_agent::{
-    AgentError, FifoPush, ImageLookup, ImageSizeError, ImageSource, Outcome, Phase, Progress,
-    RegisterAccess,
-};
 use std::cell::Cell;
 use util_io::{ByteReadError, ByteSource};
 
