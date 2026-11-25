@@ -1,0 +1,44 @@
+# Licensed under the Apache-2.0 license
+# SPDX-License-Identifier: Apache-2.0
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "orchestrator_ocp_adapter",
+    srcs = [
+        "src/lib.rs",
+    ],
+    crate_name = "openprot_orchestrator_ocp_adapter",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//services/ocp-recovery/agent:ocp_recovery_agent",
+        "//services/ocp-recovery/api:ocp_recovery_api",
+        "//services/orchestrator/capabilities:orchestrator_capabilities",
+    ],
+)
+
+# Host tests: build on the host platform, no kernel/QEMU.
+rust_test(
+    name = "orchestrator_ocp_adapter_test",
+    crate = ":orchestrator_ocp_adapter",
+)
+
+# Host end-to-end: the unmodified platform driver and checkpoint walk, with
+# the Recovery Agent against ocp_recovery_server::dispatch.
+rust_test(
+    name = "driver_host_test",
+    srcs = ["tests/driver_host.rs"],
+    edition = "2024",
+    deps = [
+        ":orchestrator_ocp_adapter",
+        "//services/ocp-recovery/agent:ocp_recovery_agent",
+        "//services/ocp-recovery/agent:ocp_recovery_test_fixture",
+        "//services/ocp-recovery/api:ocp_recovery_api",
+        "//services/orchestrator/adapters/walk:orchestrator_checkpoint_walk",
+        "//services/orchestrator/capabilities:orchestrator_capabilities",
+        "//services/orchestrator/config:orchestrator_config",
+        "//services/orchestrator/driver:orchestrator_driver",
+        "//services/orchestrator/sm:orchestrator_sm",
+    ],
+)

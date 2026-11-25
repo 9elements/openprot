@@ -28,6 +28,7 @@ rust_library(
     srcs = ["tests/fixture.rs"],
     crate_name = "ocp_recovery_test_fixture",
     edition = "2024",
+    visibility = ["//services/orchestrator/adapters/ocp:__pkg__"],
     deps = [
         ":ocp_recovery_agent",
         "//services/ocp-recovery/api:ocp_recovery_api",
