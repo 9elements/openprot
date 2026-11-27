@@ -9,7 +9,7 @@ use core::mem::offset_of;
 use zerocopy::little_endian::U16;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-use super::{struct_matches_command_table, ProtocolError};
+use super::{decode_byte, struct_matches_command_table, ProtocolError};
 use crate::command::RecoveryCommand;
 
 /// The device states of `DEVICE_STATUS` byte 0.
@@ -162,7 +162,7 @@ impl ReasonCode {
         let Ok(code) = u8::try_from(raw) else {
             return DecodedReason::Reserved(raw);
         };
-        if let Ok(reason) = RecoveryReason::try_read_from_bytes(&[code]) {
+        if let Some(reason) = decode_byte::<RecoveryReason>(code) {
             return DecodedReason::Spec(reason);
         }
         if code >= Self::VENDOR_FIRST {
@@ -374,9 +374,6 @@ const _: () = {
     // `next` returns 0 for it, so 1 tick brings the counter back into range.
     assert!(Heartbeat(U16::new(4096)).next().get() == 0);
 };
-
-// `ReasonCode::decode` reads byte 2 alone as a `RecoveryReason`.
-const _: () = assert!(core::mem::size_of::<RecoveryReason>() == 1);
 
 // Table 3 starts the vendor codes at 0x80.
 const _: () = {
