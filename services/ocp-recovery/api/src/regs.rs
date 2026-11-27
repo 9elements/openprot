@@ -8,20 +8,24 @@
 //! whose values the spec lists holds its enum, so the field holds only the
 //! listed values.
 //!
-//! `RECOVERY_CTRL` byte 2 and `DEVICE_RESET` byte 0 each hold a field the
-//! spec marks "Write 1, Device Clears". The Recovery Agent writes the command
-//! value and the device zeroes the field once it has acted, so each of these
-//! registers has an `apply_agent_write` that takes the write and a `clear_*`
-//! the device calls afterwards.
+//! `RECOVERY_CTRL` byte 2, `DEVICE_RESET` byte 0 and `INDIRECT_FIFO_CTRL`
+//! byte 1 each hold a field the spec marks "Write 1, Device Clears". The
+//! Recovery Agent writes the command value and the device zeroes the field
+//! once it has acted, so each of these registers has an `apply_agent_write`
+//! that takes the write and a `clear_*` the device calls afterwards.
 
 mod device_reset;
 mod device_status;
+mod fifo;
+mod hw_status;
 mod prot_cap;
 mod recovery_ctrl;
 mod recovery_status;
 
 pub use device_reset::*;
 pub use device_status::*;
+pub use fifo::*;
+pub use hw_status::*;
 pub use prot_cap::*;
 pub use recovery_ctrl::*;
 pub use recovery_status::*;
