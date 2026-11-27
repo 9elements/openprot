@@ -3,6 +3,10 @@
 
 //! Register layouts of the OCP Recovery interface.
 //!
+//! The crate follows OCP Secure Firmware Recovery, version 1.2. The section
+//! and table numbers in the comments, such as section 9.2 (Command Summary)
+//! and Table 3 (Recovery Reason Codes), refer to that document.
+//!
 //! A Recovery Agent drives the registers over SMBus, I3C or USB. The side
 //! being recovered answers, and the recovery spec calls that side the
 //! Device. The Recovery Agent code and the device code both use this crate.
