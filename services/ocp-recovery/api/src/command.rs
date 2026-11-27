@@ -22,10 +22,10 @@ pub enum Access {
 pub enum Length {
     /// The command carries exactly this many bytes.
     Fixed(usize),
-    /// The command carries a fixed head followed by a vendor-defined tail, so
-    /// the length runs from `min` to `max` inclusive.
+    /// The command carries fixed bytes followed by vendor data, so the
+    /// length runs from `min` to `max` inclusive.
     Range {
-        /// Smallest accepted length, the fixed head alone.
+        /// Smallest accepted length, the fixed bytes alone.
         min: usize,
         /// Largest accepted length.
         max: usize,
@@ -68,8 +68,8 @@ impl Length {
     }
 }
 
-/// When the device must answer a command, the scope column of Table 1 in the
-/// spec.
+/// The scope column of Table 1 (Recovery Command Summary) in the spec, which
+/// says when the device must answer a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     /// Scope A: the device answers whenever the recovery interface is up.
@@ -80,18 +80,18 @@ pub enum Scope {
     InterfaceActive,
 }
 
-/// Largest length of a command with a fixed head and a vendor-defined tail,
-/// and the SMBus cap of `VENDOR`, as section 9.2 of the spec states.
+/// Largest length of a command with fixed bytes followed by vendor data, and
+/// the SMBus cap of `VENDOR`, as section 9.2 of the spec states.
 const BLOCK_MAX: usize = 255;
 
 // Section 9.2 gives both caps, and a data aperture payload fits in 1 SMBus
 // block.
 const _: () = assert!(crate::SMBUS_MAX_DATA_PAYLOAD <= BLOCK_MAX);
 
-/// A length of a fixed head followed by a vendor-defined tail.
-const fn head_and_tail(head: usize) -> Length {
+/// A length of `fixed` bytes followed by vendor data.
+const fn with_vendor(fixed: usize) -> Length {
     Length::Range {
-        min: head,
+        min: fixed,
         max: BLOCK_MAX,
     }
 }
@@ -176,12 +176,12 @@ impl RecoveryCommand {
         use Scope::{Always as A, InterfaceActive as R};
         match self {
             Self::ProtCap            => Row::new(ReadOnly,  Fixed(15),         A, None),
-            Self::DeviceId           => Row::new(ReadOnly,  head_and_tail(24), A, None),
-            Self::DeviceStatus       => Row::new(ReadOnly,  head_and_tail(7),  A, None),
+            Self::DeviceId           => Row::new(ReadOnly,  with_vendor(24),   A, None),
+            Self::DeviceStatus       => Row::new(ReadOnly,  with_vendor(7),    A, None),
             Self::DeviceReset        => Row::new(ReadWrite, Fixed(3),          A, None),
             Self::RecoveryCtrl       => Row::new(ReadWrite, Fixed(3),          A, None),
             Self::RecoveryStatus     => Row::new(ReadOnly,  Fixed(2),          A, None),
-            Self::HwStatus           => Row::new(ReadOnly,  head_and_tail(4),  R, Some(HARDWARE_STATUS)),
+            Self::HwStatus           => Row::new(ReadOnly,  with_vendor(4),    R, Some(HARDWARE_STATUS)),
             Self::IndirectCtrl       => Row::new(ReadWrite, Fixed(6),          R, None),
             Self::IndirectStatus     => Row::new(ReadOnly,  Fixed(6),          R, None),
             Self::IndirectData       => Row::new(ReadWrite, DATA,              R, None),

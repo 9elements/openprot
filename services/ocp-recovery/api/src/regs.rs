@@ -2,6 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The register layouts the device serves to the Recovery Agent.
+//!
+//! Each register struct matches the byte layout of 1 command, so zerocopy
+//! converts between the struct and the bytes of the command. A 1-byte field
+//! whose values the spec lists holds its enum, so the field holds only the
+//! listed values.
+
+mod device_status;
+mod prot_cap;
+
+pub use device_status::*;
+pub use prot_cap::*;
+
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
+
+use crate::command::{Length, RecoveryCommand};
 
 bitflags::bitflags! {
     /// The capability bits of `PROT_CAP` bytes 10 and 11.
@@ -44,7 +59,9 @@ bitflags::bitflags! {
 ///
 /// The device latches the code and clears it when the Recovery Agent reads
 /// `DEVICE_STATUS`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, TryFromBytes, IntoBytes, Immutable, KnownLayout,
+)]
 #[repr(u8)]
 pub enum ProtocolError {
     /// No protocol error.
@@ -62,3 +79,26 @@ pub enum ProtocolError {
     /// Catch-all for errors the other codes do not classify.
     General = 0xff,
 }
+
+/// Whether the size of `T` equals the length the command table gives
+/// `command`: the whole length of a fixed command, or the minimum length of
+/// a [`Length::Range`] command, the fixed bytes before the vendor data. A
+/// [`Length::Payload`] command has no fixed part, so no struct matches. The
+/// command table is the truth, and a const assert in each register file
+/// checks the struct against the table with `struct_matches_command_table`.
+const fn struct_matches_command_table<T>(command: RecoveryCommand) -> bool {
+    match command.length() {
+        Length::Fixed(len) | Length::Range { min: len, .. } => len == core::mem::size_of::<T>(),
+        Length::Payload { .. } => false,
+    }
+}
+
+// The asserts pin both answers of `struct_matches_command_table`.
+const _: () = {
+    use RecoveryCommand::{DeviceStatus, ProtCap, Vendor};
+    assert!(struct_matches_command_table::<[u8; 15]>(ProtCap));
+    assert!(!struct_matches_command_table::<[u8; 14]>(ProtCap));
+    assert!(struct_matches_command_table::<[u8; 7]>(DeviceStatus));
+    assert!(!struct_matches_command_table::<[u8; 8]>(DeviceStatus));
+    assert!(!struct_matches_command_table::<[u8; 1]>(Vendor));
+};
