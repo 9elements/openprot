@@ -7,16 +7,29 @@
 //! converts between the struct and the bytes of the command. A 1-byte field
 //! whose values the spec lists holds its enum, so the field holds only the
 //! listed values.
+//!
+//! `RECOVERY_CTRL` byte 2 and `DEVICE_RESET` byte 0 each hold a field the
+//! spec marks "Write 1, Device Clears". The Recovery Agent writes the command
+//! value and the device zeroes the field once it has acted, so each of these
+//! registers has an `apply_agent_write` that takes the write and a `clear_*`
+//! the device calls afterwards.
 
+mod device_reset;
 mod device_status;
 mod prot_cap;
+mod recovery_ctrl;
+mod recovery_status;
 
+pub use device_reset::*;
 pub use device_status::*;
 pub use prot_cap::*;
+pub use recovery_ctrl::*;
+pub use recovery_status::*;
 
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::command::{Length, RecoveryCommand};
+use crate::error::WireError;
 
 bitflags::bitflags! {
     /// The capability bits of `PROT_CAP` bytes 10 and 11.
@@ -102,3 +115,41 @@ const _: () = {
     assert!(!struct_matches_command_table::<[u8; 8]>(DeviceStatus));
     assert!(!struct_matches_command_table::<[u8; 1]>(Vendor));
 };
+
+/// Decodes 1 byte into a field enum, or `None` if the spec does not define
+/// the value.
+fn decode_byte<T: TryFromBytes + KnownLayout + Immutable>(value: u8) -> Option<T> {
+    const { assert!(core::mem::size_of::<T>() == 1) };
+    T::try_read_from_bytes(&[value]).ok()
+}
+
+/// Decodes byte `offset` of a write from the Recovery Agent into the field
+/// enum at that offset, or reports the offset and the value the spec does
+/// not define for the field.
+///
+/// Every caller passes `offset_of!` of a field of the struct whose bytes
+/// `write` holds, so the index stays inside `write`.
+fn decode_field<T: TryFromBytes + KnownLayout + Immutable>(
+    command: RecoveryCommand,
+    write: &[u8],
+    offset: usize,
+) -> Result<T, WireError> {
+    let value = write[offset];
+    decode_byte(value).ok_or(WireError::UnsupportedParameter {
+        command,
+        offset,
+        value,
+    })
+}
+
+/// Returns a write off the wire as the array a fixed-length register takes,
+/// or [`WireError::LengthMismatch`] for another length.
+fn sized_write<const N: usize>(
+    command: RecoveryCommand,
+    bytes: &[u8],
+) -> Result<&[u8; N], WireError> {
+    bytes.try_into().ok().ok_or(WireError::LengthMismatch {
+        command,
+        got: bytes.len(),
+    })
+}
