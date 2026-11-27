@@ -1,7 +1,8 @@
-# What the QEMU integration tests do not cover
+# Gaps in the integration tests and in the design
 
-Written 2026-10-05. The scenarios and how to run them are in README.md;
-this is the list of what a green run still does not say.
+Written 2026-10-05. The scenarios and how to run them are in README.md.
+GAPS.md lists what a green run still does not say, and the design
+questions the code leaves open.
 
 ## The two halves have met, in one scenario
 
@@ -264,6 +265,47 @@ answer says granted while the floor still holds the old SVN. Two changes
 close this: re-attempt the pass or mark the slot stale somewhere
 durable, and answer the Update Agent once the SVN floor advances
 rather than when the effect arrives.
+
+## The reset around an update of a downstream device
+
+The `Updatable` doc comment in `capabilities/src/updatable.rs` names a
+direct-flash adapter, which writes the payload into the inactive slot of
+the downstream device, and a PLDM adapter for a downstream device that
+is a Firmware Device. In `full_update`, the downstream device is the
+Firmware Device and pulls its chunks from the Update Agent, and
+`FdUpdatable::poll_stage` returns `Ready` without a transfer. The
+downstream device has to run to pull its chunks, and the state machine
+asserts no reset in `State::Updating`.
+
+After `Effect::ActivateUpdate`, the state machine enters
+`PreSupervision`, and `quiesce_all` asserts the reset of every released
+component. The driver then runs `VerifyFirmware`, and the state machine
+emits `ReleaseReset` only on `VerificationPassed`. The `AssertReset`
+contract in `sm/src/platform.rs` requires the platform driver to keep
+the reset asserted until the release, so the downstream device cannot
+run or rewrite its flash between the check and the release. The
+power-on walk verifies with the reset held as well.
+
+The driver reads the image through the `ImageSource` the board wires.
+The `ImageSource` doc comment in `driver/src/board.rs` names interposed
+flash and a PLDM/MCTP transfer as sources. With interposed flash, the
+eRoT reads the flash while the reset holds the downstream device. A
+downstream device held in reset answers no PLDM or MCTP request, so an
+`ImageSource` over PLDM or MCTP has no image to serve. The tree has no
+`ImageSource` for flash or for PLDM: `MemImage` reads RAM, and
+`StubImage` serves no bytes.
+
+Undecided:
+
+- How the driver verifies a downstream device that takes its image over
+  PLDM and has no interposed flash. Candidates are a check with the
+  downstream device running, a measurement the downstream device
+  reports, and the authentication of the candidate before
+  `Effect::ActivateUpdate`.
+- Whether a direct-flash adapter can write the inactive slot while the
+  downstream device runs from the active slot of the same flash. The
+  `Updatable` contract makes staging inert for the active image and does
+  not say whether the write needs the reset held.
 
 ## Assertions that are looser than they look
 
