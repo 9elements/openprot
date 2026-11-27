@@ -1,7 +1,8 @@
-# What the QEMU integration tests do not cover
+# Gaps in the integration tests and in the design
 
-Written 2026-10-05. The scenarios and how to run them are in README.md;
-this is the list of what a green run still does not say.
+Written 2026-10-05. The scenarios and how to run them are in README.md.
+GAPS.md lists what a green run still does not say, and the design
+questions the code leaves open.
 
 ## The two halves have met, in one scenario
 
